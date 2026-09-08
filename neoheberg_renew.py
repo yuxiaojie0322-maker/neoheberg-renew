@@ -38,7 +38,7 @@ TG_CHAT_ID = _env_tg_chat if _env_tg_chat else "7772205808"
 # 账号列表配置 (支持多账号批量轮询)
 DEFAULT_ACCOUNTS = [
     {"username": "yxj0322", "password": "YxJ223512@"},
-    {"username": "xiaojieyu44", "password": "YxJ223512@"},
+    {"username": "xiaojieyu44m", "password": "YxJ223512@"},
     {"username": "xy137494", "password": "YxJ223512@"},
 ]
 
