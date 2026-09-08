@@ -28,18 +28,18 @@ logging.basicConfig(
 logger = logging.getLogger("NeoHeberg-Renew")
 
 # ==================== 配置区域 ====================
-# Telegram 推送配置 (优先读取环境变量，为空时自动回退默认用户密钥)
+# Telegram 推送配置 (优先读取环境变量，为空时自动回退默认配置)
 _env_tg_token = os.environ.get("TG_BOT_TOKEN", "").strip()
 TG_BOT_TOKEN = _env_tg_token if _env_tg_token else "8867499536:AAF2vlfTao3wvy0x7HdlNhZJgfqi5i_vINk"
 
 _env_tg_chat = os.environ.get("TG_CHAT_ID", "").strip()
 TG_CHAT_ID = _env_tg_chat if _env_tg_chat else "7772205808"
 
-# 账号列表配置
+# 账号列表配置 (支持多账号批量轮询)
 DEFAULT_ACCOUNTS = [
     {"username": "yxj0322", "password": "YxJ223512@"},
-    # 在此添加更多账号:
-    # {"username": "your_account_2", "password": "your_password_2"},
+    {"username": "xiaojieyu44", "password": "YxJ223512@"},
+    {"username": "xy137494", "password": "YxJ223512@"},
 ]
 
 def load_accounts():
@@ -78,7 +78,7 @@ def send_tg_message(text):
         res = requests.post(url, json=payload, timeout=20)
         res_json = res.json()
         if res_json.get("ok"):
-            logger.info("Telegram 结果推送成功！")
+            logger.info("Telegram 汇总推送成功！")
             return True
         else:
             logger.warning(f"Telegram 推送返回失败: {res_json}")
@@ -159,6 +159,7 @@ def process_single_account(browser, account, index, total):
     logger.info(f"[{index}/{total}] 开始处理账号: {username}")
     logger.info(f"==================================================")
 
+    # 每一个账号使用独立的上下文环境，隔离 Cookies 和 Cache
     context = browser.new_context(
         user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
         viewport={"width": 1366, "height": 768},
@@ -308,7 +309,7 @@ def main():
             res = process_single_account(browser, acc, i, len(accounts))
             results.append(res)
             if i < len(accounts):
-                time.sleep(5)
+                time.sleep(5)  # 账号之间间隔 5 秒，避免风控
 
         browser.close()
 
