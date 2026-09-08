@@ -25,16 +25,16 @@ jobs:
       - name: 安装依赖
         run: |
           python -m pip install --upgrade pip
-          pip install playwright
+          pip install -r requirements.txt
           playwright install --with-deps chromium
 
       - name: 执行登录与 VPS 重启保活任务
         env:
-          # 多个账号可在 GitHub Repo -> Settings -> Secrets and variables -> Actions 中添加
-          # 变量名: NEOHEBERG_ACCOUNTS
-          # 格式支持 JSON: [{"username": "...", "password": "..."}, ...]
-          # 或英文逗号分隔: yxj0322:YxJ223512@,user2:pass2
+          # 多账号配置: 格式支持 username:password,username2:password2 或 JSON
           NEOHEBERG_ACCOUNTS: ${{ secrets.NEOHEBERG_ACCOUNTS }}
+          # Telegram 推送配置
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           HEADLESS: "true"
         run: |
           python neoheberg_renew.py
