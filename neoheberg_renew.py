@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-NeoHeberg VPS 自动登录与重启保活脚本 (支持多账号 + Telegram 结果推送)
+NeoHeberg VPS 自动登录与重启保活脚本 (支持多账号 + Telegram 截图推送)
 - 登录: https://extranet.neoheberg.fr/login
 - 自动处理 Cap-Widget 验证
 - 查找 VPS 并点击 "Gerer" (管理)
 - 找到 ACTIONS 中的 "Redémarrer" (重启) 并执行
 - 支持多账号轮询与 GitHub Actions 定时运行
-- 支持 Telegram Bot 运行结果与截图消息推送
+- 支持 Telegram Bot 运行结果与实时截图消息推送
 """
 
 import os
@@ -28,14 +28,11 @@ logging.basicConfig(
 logger = logging.getLogger("NeoHeberg-Renew")
 
 # ==================== 配置区域 ====================
-# Telegram 推送配置 (从环境变量读取)
-TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "").strip()
-TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "").strip()
+# Telegram 推送配置 (优先从环境变量读取，其次使用内置配置)
+TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "8867499536:AAF2vlfTao3wvy0x7HdlNhZJgfqi5i_vINk").strip()
+TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "7772205808").strip()
 
 # 账号列表配置
-# 优先从环境变量 NEOHEBERG_ACCOUNTS 读取，格式为 JSON: [{"username": "...", "password": "..."}, ...]
-# 或以英文逗号分隔: username:password,username2:password2
-# 如果环境变量未设置，则使用下方默认列表
 DEFAULT_ACCOUNTS = [
     {"username": "yxj0322", "password": "YxJ223512@"},
     # 在此添加更多账号:
@@ -87,7 +84,7 @@ def send_tg_message(text):
         logger.error(f"Telegram 发送异常: {e}")
         return False
 
-def send_tg_photo(photo_path, caption):
+def send_tg_photo(photo_path, caption=""):
     """发送带截图的通知到 Telegram"""
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
         return False
@@ -99,7 +96,7 @@ def send_tg_photo(photo_path, caption):
             files = {"photo": f}
             data = {
                 "chat_id": TG_CHAT_ID,
-                "caption": caption,
+                "caption": caption[:1024],  # TG 单张图文附言最大 1024 字符
                 "parse_mode": "HTML"
             }
             res = requests.post(url, files=files, data=data, timeout=30)
@@ -170,7 +167,8 @@ def process_single_account(browser, account, index, total):
         "status": "FAIL",
         "message": "未知原因",
         "duration": 0,
-        "screenshot": None
+        "screenshot": None,
+        "panel_url": ""
     }
 
     try:
@@ -235,6 +233,7 @@ def process_single_account(browser, account, index, total):
         page.wait_for_load_state("networkidle", timeout=20000)
         time.sleep(2)
         panel_url = page.url
+        result_info["panel_url"] = panel_url
         logger.info(f"已进入 VPS 管理详情页: {panel_url}")
 
         # 查找 ACTIONS 中的 "Redémarrer" (重启) 按钮
@@ -270,7 +269,6 @@ def process_single_account(browser, account, index, total):
         result_info["status"] = "SUCCESS"
         result_info["message"] = "VPS 重启指令下发成功"
         result_info["screenshot"] = success_shot
-        result_info["panel_url"] = panel_url
         return result_info
 
     except Exception as e:
@@ -318,39 +316,42 @@ def main():
     logger.info(f"任务执行结束: 成功 {len(success_list)} 个, 失败 {len(fail_list)} 个")
     logger.info("==================================================")
 
-    # 构造 Telegram 推送内容
+    # 构造 Telegram 推送通知
     now_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    status_emoji = "🎉" if len(fail_list) == 0 else "⚠️"
-    
-    msg_lines = [
-        f"{status_emoji} <b>NeoHeberg VPS 自动保活通知</b>",
-        "━━━━━━━━━━━━━━━━━━"
-    ]
 
-    for r in results:
-        badge = "✅ 重启成功" if r["status"] == "SUCCESS" else f"❌ {r['message']}"
-        msg_lines.append(f"👤 <b>账号</b>: <code>{r['username']}</code>")
-        msg_lines.append(f"📊 <b>状态</b>: {badge} (耗时 {r['duration']}s)")
-        if r.get("panel_url"):
-            msg_lines.append(f"🔗 <b>面板</b>: <a href=\"{r['panel_url']}\">查看详情</a>")
-        msg_lines.append("──────────────────")
-
-    msg_lines.append(f"📈 <b>汇总</b>: 成功 {len(success_list)} / 失败 {len(fail_list)}")
-    msg_lines.append(f"⏰ <b>时间</b>: {now_time}")
-
-    tg_content = "\n".join(msg_lines)
-
-    # 如果有成功截图，带上第一张截图发送；否则发纯文本
-    sent_photo = False
+    # 1. 逐个账号发送其实时执行截图
     for r in results:
         if r.get("screenshot") and os.path.exists(r["screenshot"]):
-            logger.info(f"正在向 Telegram 发送带截图的运行报告: {r['screenshot']}")
-            send_tg_photo(r["screenshot"], tg_content)
-            sent_photo = True
-            break
+            status_tag = "✅ 重启成功" if r["status"] == "SUCCESS" else f"❌ 失败: {r['message']}"
+            shot_caption = (
+                f"📸 <b>NeoHeberg VPS 执行截图</b>\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"👤 <b>账号</b>: <code>{r['username']}</code>\n"
+                f"📊 <b>状态</b>: {status_tag}\n"
+                f"⏱ <b>耗时</b>: {r['duration']}s\n"
+                f"⏰ <b>时间</b>: {now_time}"
+            )
+            if r.get("panel_url"):
+                shot_caption += f"\n🔗 <b>面板</b>: {r['panel_url']}"
+            logger.info(f"正在推送账号 {r['username']} 的截图到 Telegram...")
+            send_tg_photo(r["screenshot"], shot_caption)
+            time.sleep(1)
 
-    if not sent_photo:
-        send_tg_message(tg_content)
+    # 2. 发送最终总体运行报表
+    status_emoji = "🎉" if len(fail_list) == 0 else "⚠️"
+    msg_lines = [
+        f"{status_emoji} <b>NeoHeberg VPS 自动保活总汇报</b>",
+        "━━━━━━━━━━━━━━━━━━"
+    ]
+    for r in results:
+        badge = "✅ 重启成功" if r["status"] == "SUCCESS" else f"❌ {r['message']}"
+        msg_lines.append(f"👤 <code>{r['username']}</code>: {badge} ({r['duration']}s)")
+    msg_lines.append("──────────────────")
+    msg_lines.append(f"📈 <b>汇总</b>: 成功 {len(success_list)} 个 | 失败 {len(fail_list)} 个")
+    msg_lines.append(f"⏰ <b>完成时间</b>: {now_time}")
+
+    tg_summary = "\n".join(msg_lines)
+    send_tg_message(tg_summary)
 
     if len(fail_list) > 0 and len(success_list) == 0:
         sys.exit(1)
