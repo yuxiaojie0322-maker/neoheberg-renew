@@ -210,7 +210,8 @@ def process_single_account(browser, account, index, total):
         time.sleep(1.5)
 
         # 检查是否弹出了二次确认弹窗 (例如 "Confirmer" / "Oui" / "Valider")
-        confirm_btn = page.locator('button:has-text("Confirmer"), button:has-text("Oui"), button:has-text("Valider"), button:has-text("Redémarrer"):visible').filter(has_text=lambda t: "Confirm" in t or "Oui" in t or "Valider" in t)
+        import re
+        confirm_btn = page.locator('button, a').filter(has_text=re.compile(r'(Confirmer|Valider|Oui|Yes|Confirm)', re.I))
         if confirm_btn.count() > 0 and confirm_btn.first.is_visible():
             logger.info("检测到二次确认弹窗，正在点击确认...")
             confirm_btn.first.click()
