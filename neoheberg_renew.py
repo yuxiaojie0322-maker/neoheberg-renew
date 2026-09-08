@@ -28,9 +28,12 @@ logging.basicConfig(
 logger = logging.getLogger("NeoHeberg-Renew")
 
 # ==================== 配置区域 ====================
-# Telegram 推送配置 (优先从环境变量读取，其次使用内置配置)
-TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "8867499536:AAF2vlfTao3wvy0x7HdlNhZJgfqi5i_vINk").strip()
-TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "7772205808").strip()
+# Telegram 推送配置 (优先读取环境变量，为空时自动回退默认用户密钥)
+_env_tg_token = os.environ.get("TG_BOT_TOKEN", "").strip()
+TG_BOT_TOKEN = _env_tg_token if _env_tg_token else "8867499536:AAF2vlfTao3wvy0x7HdlNhZJgfqi5i_vINk"
+
+_env_tg_chat = os.environ.get("TG_CHAT_ID", "").strip()
+TG_CHAT_ID = _env_tg_chat if _env_tg_chat else "7772205808"
 
 # 账号列表配置
 DEFAULT_ACCOUNTS = [
