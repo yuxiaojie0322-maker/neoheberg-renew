@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-NeoHeberg VPS 自动登录与重启保活脚本 (支持多账号 + Cloudflare Turnstile 穿透 + Telegram 截图推送)
+NeoHeberg VPS 自动登录与重启保活脚本 (支持多账号 + 节点代理 + Cloudflare Turnstile 穿透 + Telegram 推送)
 - 登录: https://extranet.neoheberg.fr/login
+- 自动启动 Sing-box 转发 Hysteria2 / Vless / Socks5 / HTTP 节点，彻底规避机房 IP 风控
 - 自动检测并穿透 Cloudflare Turnstile / Managed Challenge (5秒盾)
 - 自动处理 Cap-Widget 验证
 - 查找 VPS 并点击 "Gerer" (管理)
@@ -12,11 +13,14 @@ NeoHeberg VPS 自动登录与重启保活脚本 (支持多账号 + Cloudflare Tu
 """
 
 import os
+import re
 import sys
 import time
 import json
 import logging
 import datetime
+import urllib.parse
+import subprocess
 import requests
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 
@@ -36,6 +40,11 @@ TG_BOT_TOKEN = _env_tg_token if _env_tg_token else "8867499536:AAF2vlfTao3wvy0x7
 _env_tg_chat = os.environ.get("TG_CHAT_ID", "").strip()
 TG_CHAT_ID = _env_tg_chat if _env_tg_chat else "7772205808"
 
+# 节点代理配置 (支持 Hysteria2 / Vless / Socks5 / HTTP)
+_env_proxy_node = os.environ.get("PROXY_NODE", "").strip()
+_env_proxy_url = os.environ.get("PROXY_URL", "").strip()
+DEFAULT_PROXY_NODE = _env_proxy_node if _env_proxy_node else (_env_proxy_url if _env_proxy_url else "hysteria2://031e1b07-ac55-476d-a415-4b3c5fc411f5@83.168.94.238:30005?sni=www.bing.com&insecure=1&alpn=h3#PL-HY2-2")
+
 # 账号列表配置 (支持多账号批量轮询)
 DEFAULT_ACCOUNTS = [
     {"username": "yxj0322", "password": "YxJ223512@"},
@@ -43,14 +52,12 @@ DEFAULT_ACCOUNTS = [
     {"username": "xy137494", "password": "YxJ223512@"},
 ]
 
-# Anti-Detection Stealth Script (注入抹除自动化指纹，防止 Cloudflare 直接拦截)
+# Anti-Detection Stealth Script (抹除自动化指纹)
 STEALTH_JS = """
-// 抹除 navigator.webdriver 指纹
 Object.defineProperty(navigator, 'webdriver', {
     get: () => undefined
 });
 
-// 模拟 window.chrome 运行环境
 if (!window.chrome) {
     window.chrome = {};
 }
@@ -60,17 +67,14 @@ window.chrome.runtime = window.chrome.runtime || {
     PlatformNaclArch: { ARM: 'arm', X86_32: 'x86-32', X86_64: 'x86-64' }
 };
 
-// 伪造插件列表
 Object.defineProperty(navigator, 'plugins', {
     get: () => [1, 2, 3, 4, 5]
 });
 
-// 伪造语言包
 Object.defineProperty(navigator, 'languages', {
     get: () => ['fr-FR', 'fr', 'en-US', 'en']
 });
 
-// 伪造通知权限查询
 const origQuery = window.navigator.permissions ? window.navigator.permissions.query : null;
 if (origQuery) {
     window.navigator.permissions.query = (parameters) => (
@@ -80,6 +84,137 @@ if (origQuery) {
     );
 }
 """
+
+def parse_proxy_link(link):
+    """解析节点链接 (支持 direct HTTP/SOCKS5 与 Hysteria2)"""
+    link = re.sub(r'\[sni=([^\]]+)\]\([^\)]+\)', r'sni=\1', link)
+    link = link.strip()
+    if not link:
+        return None
+        
+    if link.startswith("http://") or link.startswith("https://") or link.startswith("socks5://"):
+        return {"type": "direct_proxy", "url": link}
+        
+    if link.startswith("hysteria2://") or link.startswith("hy2://"):
+        u = urllib.parse.urlparse(link)
+        netloc = u.netloc
+        if "@" in netloc:
+            auth, host_port = netloc.split("@", 1)
+        else:
+            auth = ""
+            host_port = netloc
+            
+        if ":" in host_port:
+            server, port = host_port.split(":")
+            port = int(port)
+        else:
+            server = host_port
+            port = 443
+            
+        params = urllib.parse.parse_qs(u.query)
+        sni = params.get("sni", [""])[0] or server
+        insecure = params.get("insecure", ["0"])[0] in ["1", "true", "True"]
+        alpn = params.get("alpn", ["h3"])
+        if isinstance(alpn, str):
+            alpn = [alpn]
+            
+        return {
+            "type": "hysteria2",
+            "server": server,
+            "port": port,
+            "auth": auth,
+            "sni": sni,
+            "insecure": insecure,
+            "alpn": alpn
+        }
+    return None
+
+def start_proxy(proxy_node_str, listen_port=10808):
+    """启动本地 sing-box 转发并将本地 SOCKS5/HTTP 代理返回给 Playwright"""
+    if not proxy_node_str:
+        return None
+        
+    parsed = parse_proxy_link(proxy_node_str)
+    if not parsed:
+        logger.warning(f"无法识别代理节点链接: {proxy_node_str[:25]}...")
+        return None
+        
+    if parsed["type"] == "direct_proxy":
+        logger.info(f"使用直接代理: {parsed['url']}")
+        return parsed["url"]
+        
+    logger.info(f"检测到 {parsed['type']} 节点，正在配置 sing-box 本地转发 (端口 {listen_port})...")
+    
+    # 针对 Linux 环境自动下载 sing-box 客户端
+    singbox_bin = "./sing-box"
+    if sys.platform.startswith("linux"):
+        if not os.path.exists(singbox_bin):
+            logger.info("正在下载 sing-box 官方二进制...")
+            try:
+                url = "https://github.com/SagerNet/sing-box/releases/download/v1.9.3/sing-box-1.9.3-linux-amd64.tar.gz"
+                subprocess.run(["curl", "-sLo", "sing-box.tar.gz", url], check=True)
+                subprocess.run(["tar", "-xzf", "sing-box.tar.gz", "--strip-components=1"], check=True)
+                subprocess.run(["chmod", "+x", singbox_bin], check=True)
+                logger.info("sing-box 安装完成")
+            except Exception as e:
+                logger.error(f"下载 sing-box 失败: {e}")
+                return None
+    else:
+        singbox_bin = "sing-box.exe"
+        if not os.path.exists(singbox_bin):
+            logger.info("非 Linux 环境且未找到本地 sing-box.exe，尝试直接连接")
+            return None
+
+    # 生成 sing-box 客户端配置
+    config = {
+        "log": {"level": "warn"},
+        "inbounds": [
+            {
+                "type": "mixed",
+                "tag": "mixed-in",
+                "listen": "127.0.0.1",
+                "listen_port": listen_port
+            }
+        ],
+        "outbounds": [
+            {
+                "type": "hysteria2",
+                "tag": "hy2-out",
+                "server": parsed["server"],
+                "server_port": parsed["port"],
+                "password": parsed["auth"],
+                "tls": {
+                    "enabled": True,
+                    "server_name": parsed["sni"],
+                    "insecure": parsed["insecure"],
+                    "alpn": parsed["alpn"]
+                }
+            }
+        ]
+    }
+    
+    config_file = "singbox_proxy_config.json"
+    with open(config_file, "w", encoding="utf-8") as f:
+        json.dump(config, f, indent=2)
+        
+    try:
+        logger.info(f"启动 sing-box 转发服务...")
+        proc = subprocess.Popen([singbox_bin, "run", "-c", config_file], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(3)
+        
+        # 测试出口 IP
+        local_http_proxy = f"http://127.0.0.1:{listen_port}"
+        try:
+            res = requests.get("https://api.ipify.org?format=json", proxies={"http": local_http_proxy, "https": local_http_proxy}, timeout=10)
+            out_ip = res.json().get("ip")
+            logger.info(f"✅ 节点代理转发启动成功！代理出口 IP: {out_ip}")
+        except Exception as e:
+            logger.warning(f"代理测试请求未返回 (可能由于测试超时): {e}，仍使用本地代理")
+            
+        return f"socks5://127.0.0.1:{listen_port}"
+    except Exception as e:
+        logger.error(f"启动 sing-box 异常: {e}")
+        return None
 
 def load_accounts():
     env_accounts = os.environ.get("NEOHEBERG_ACCOUNTS", "").strip()
@@ -104,7 +239,6 @@ def load_accounts():
 def send_tg_message(text):
     """发送纯文本消息到 Telegram"""
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
-        logger.info("未配置 TG_BOT_TOKEN 或 TG_CHAT_ID，跳过 Telegram 推送")
         return False
     try:
         url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
@@ -170,13 +304,13 @@ def is_cf_challenge_present(page):
             if kw in title or kw in content:
                 return True
         for frame in page.frames:
-            if "challenges.cloudflare.com" in frame.url or "turnstile" in frame.url:
+            if frame != page.main_frame:
                 return True
     except Exception:
         pass
     return False
 
-def handle_cloudflare_challenge(page, timeout=35):
+def handle_cloudflare_challenge(page, timeout=30):
     """检测并尝试穿透 Cloudflare Turnstile / Managed Challenge 人机质询"""
     if not is_cf_challenge_present(page):
         return True
@@ -191,43 +325,44 @@ def handle_cloudflare_challenge(page, timeout=35):
             return True
 
         clicked = False
-        # 1. 尝试在所有 subframes 中定位并点击 Turnstile 勾选框
+        # 1. 遍历所有 subframes 尝试点击复选框
         for frame in page.frames:
+            if frame == page.main_frame:
+                continue
             try:
-                if "cloudflare.com" in frame.url or "turnstile" in frame.url:
-                    checkbox = frame.locator('input[type="checkbox"], .ctp-checkbox-label, #challenge-stage')
-                    if checkbox.count() > 0 and checkbox.first.is_visible():
-                        box = checkbox.first.bounding_box()
-                        if box:
-                            logger.info(f"找到 Cloudflare Turnstile 勾选框，坐标 ({round(box['x'], 1)}, {round(box['y'], 1)})，正在模拟点击...")
-                            page.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2, steps=6)
-                            time.sleep(0.3)
-                            page.mouse.click(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
-                        else:
-                            checkbox.first.click(timeout=3000)
+                checkbox = frame.locator('input[type="checkbox"], .ctp-checkbox-label, #challenge-stage')
+                if checkbox.count() > 0 and checkbox.first.is_visible():
+                    box = checkbox.first.bounding_box()
+                    if box and box["width"] > 0 and box["height"] > 0:
+                        logger.info(f"在框架内定位到复选框，正在模拟点击...")
+                        page.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2, steps=5)
+                        time.sleep(0.3)
+                        page.mouse.click(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
                         clicked = True
                         time.sleep(3)
                         break
             except Exception as e:
-                logger.debug(f"遍历 Turnstile frame 异常: {e}")
+                logger.debug(f"遍历 frame 异常: {e}")
 
-        # 2. 如果 frame 内部不可直接点击，定位主页面上的 CF iframe 容器并点击左侧复选框位置
+        # 2. 定位主页面上的 iframe 元素并点击复选框位置
         if not clicked:
             try:
-                cf_iframe = page.locator('iframe[src*="challenges.cloudflare.com"]')
-                if cf_iframe.count() > 0 and cf_iframe.first.is_visible():
-                    box = cf_iframe.first.bounding_box()
-                    if box:
-                        click_x = box["x"] + 30
-                        click_y = box["y"] + (box["height"] / 2)
-                        logger.info(f"模拟点击 Cloudflare 质询区域 ({round(click_x, 1)}, {round(click_y, 1)})...")
-                        page.mouse.move(click_x, click_y, steps=6)
-                        time.sleep(0.3)
-                        page.mouse.click(click_x, click_y)
-                        clicked = True
-                        time.sleep(3)
+                iframes = page.locator('iframe').all()
+                for ifr in iframes:
+                    if ifr.is_visible():
+                        box = ifr.bounding_box()
+                        if box and box["width"] > 0 and box["height"] > 0:
+                            click_x = box["x"] + 30
+                            click_y = box["y"] + (box["height"] / 2)
+                            logger.info(f"模拟点击 iframe 复选框区域 ({round(click_x, 1)}, {round(click_y, 1)})...")
+                            page.mouse.move(click_x, click_y, steps=5)
+                            time.sleep(0.3)
+                            page.mouse.click(click_x, click_y)
+                            clicked = True
+                            time.sleep(3)
+                            break
             except Exception as e:
-                logger.debug(f"点击 Cloudflare 容器异常: {e}")
+                logger.debug(f"点击 iframe 容器异常: {e}")
 
         time.sleep(1)
 
@@ -275,7 +410,7 @@ def handle_cap_widget(page):
         logger.warning(f"Cap-Widget 处理异常(可能无须手动操作): {e}")
     return True
 
-def process_single_account(browser, account, index, total):
+def process_single_account(browser, account, index, total, proxy_server=None):
     username = account.get("username", "").strip()
     password = account.get("password", "").strip()
     start_time = time.time()
@@ -283,8 +418,11 @@ def process_single_account(browser, account, index, total):
     logger.info(f"[{index}/{total}] 开始处理账号: {username}")
     logger.info(f"==================================================")
 
+    proxy_cfg = {"server": proxy_server} if proxy_server else None
+
     # 每一个账号使用独立的上下文环境，隔离 Cookies 和 Cache，并注入防指纹脚本
     context = browser.new_context(
+        proxy=proxy_cfg,
         user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
         viewport={"width": 1366, "height": 768},
         locale="fr-FR",
@@ -309,7 +447,7 @@ def process_single_account(browser, account, index, total):
         time.sleep(2)
 
         # 检查初始进入是否有 CF 质询
-        handle_cloudflare_challenge(page, timeout=30)
+        handle_cloudflare_challenge(page, timeout=25)
 
         # 支持登录重试（若穿透 CF 后页面刷新，自动进行第二轮填写提交）
         login_success = False
@@ -323,7 +461,7 @@ def process_single_account(browser, account, index, total):
                 page.wait_for_selector('input#email, input[name="email"]', timeout=12000)
             except PlaywrightTimeout:
                 if is_cf_challenge_present(page):
-                    handle_cloudflare_challenge(page, timeout=30)
+                    handle_cloudflare_challenge(page, timeout=25)
                     time.sleep(2)
 
             email_input = page.locator('input#email, input[name="email"]')
@@ -350,7 +488,7 @@ def process_single_account(browser, account, index, total):
             # 点击登录后，如果遇到 Cloudflare 质询拦截，执行穿透处理
             if is_cf_challenge_present(page):
                 logger.info("登录提交后触发 Cloudflare 质询，正在执行自动穿透...")
-                handle_cloudflare_challenge(page, timeout=35)
+                handle_cloudflare_challenge(page, timeout=25)
 
             # 等待登录成功跳转
             try:
@@ -361,7 +499,7 @@ def process_single_account(browser, account, index, total):
             except PlaywrightTimeout:
                 logger.warning(f"第 {attempt} 次提交未立即跳转，检查页面状态...")
                 if is_cf_challenge_present(page):
-                    handle_cloudflare_challenge(page, timeout=25)
+                    handle_cloudflare_challenge(page, timeout=20)
 
                 if "/login" not in page.url:
                     logger.info(f"登录成功！当前页面: {page.url}")
@@ -435,7 +573,6 @@ def process_single_account(browser, account, index, total):
         time.sleep(1.5)
 
         # 处理二次确认弹窗
-        import re
         confirm_btn = page.locator('button, a').filter(has_text=re.compile(r'(Confirmer|Valider|Oui|Yes|Confirm)', re.I))
         if confirm_btn.count() > 0 and confirm_btn.first.is_visible():
             logger.info("检测到二次确认弹窗，点击确认...")
@@ -472,6 +609,14 @@ def main():
         sys.exit(1)
 
     logger.info(f"开始执行 NeoHeberg 自动保活任务，共加载 {len(accounts)} 个账号")
+    
+    # 启动节点代理转发
+    proxy_server = start_proxy(DEFAULT_PROXY_NODE)
+    if proxy_server:
+        logger.info(f"使用代理服务: {proxy_server}")
+    else:
+        logger.info("未启用代理服务，将使用直连网络")
+
     headless = os.environ.get("HEADLESS", "true").lower() != "false"
 
     results = []
@@ -488,7 +633,7 @@ def main():
         )
 
         for i, acc in enumerate(accounts, 1):
-            res = process_single_account(browser, acc, i, len(accounts))
+            res = process_single_account(browser, acc, i, len(accounts), proxy_server=proxy_server)
             results.append(res)
             if i < len(accounts):
                 time.sleep(5)  # 账号之间间隔 5 秒，避免风控
