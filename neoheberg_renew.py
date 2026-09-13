@@ -373,6 +373,19 @@ def handle_cloudflare_challenge(page, timeout=30):
     logger.warning("Cloudflare 验证处理已达最大等待时间，尝试继续后续操作...")
     return False
 
+def handle_gdpr_consent(page):
+    """自动关闭欧洲 GDPR Cookie 授权弹窗 (Funding Choices)"""
+    try:
+        consent_modal = page.locator('.fc-consent-root, div[class*="fc-consent"]')
+        if consent_modal.count() > 0 and consent_modal.first.is_visible(timeout=2000):
+            logger.info("检测到 GDPR Cookie 授权弹窗，正在自动点击授权...")
+            btn = page.locator('.fc-consent-root button.fc-primary-button, .fc-consent-root button:has-text("Consent"), .fc-consent-root button:has-text("Autoriser"), .fc-consent-root button:has-text("Accepter"), .fc-consent-root .fc-button-label')
+            if btn.count() > 0 and btn.first.is_visible():
+                btn.first.click(timeout=3000, force=True)
+                time.sleep(1)
+    except Exception as e:
+        logger.debug(f"处理 GDPR 弹窗异常: {e}")
+
 def handle_cap_widget(page):
     """处理 NeoHeberg 登录页面的 Cap-Widget 人机验证组件"""
     logger.info("检查是否存在 Cap-Widget 人机验证...")
@@ -446,8 +459,9 @@ def process_single_account(browser, account, index, total, proxy_server=None):
         page.goto(login_url, wait_until="domcontentloaded", timeout=35000)
         time.sleep(2)
 
-        # 检查初始进入是否有 CF 质询
+        # 检查初始进入是否有 CF 质询与 GDPR
         handle_cloudflare_challenge(page, timeout=25)
+        handle_gdpr_consent(page)
 
         # 支持登录重试（若穿透 CF 后页面刷新，自动进行第二轮填写提交）
         login_success = False
@@ -522,16 +536,19 @@ def process_single_account(browser, account, index, total, proxy_server=None):
             return result_info
 
         time.sleep(2)
+        handle_gdpr_consent(page)
 
         # 寻找 VPS 管理入口 (Gerer)
         logger.info("正在查找 VPS 管理按钮 (Gerer / Gérer)...")
         vps_tab = page.locator('div:has-text("VPS"), button:has-text("VPS"), a:has-text("VPS")').filter(has_text="VPS")
         if vps_tab.count() > 0:
             try:
-                vps_tab.first.click(timeout=2000)
+                vps_tab.first.click(timeout=2000, force=True)
                 time.sleep(1)
             except Exception:
                 pass
+
+        handle_gdpr_consent(page)
 
         gerer_btn = page.locator('a:has-text("Gerer"), button:has-text("Gerer"), a:has-text("Gérer"), button:has-text("Gérer"), [href*="/vps/"]')
         if gerer_btn.count() == 0:
@@ -545,11 +562,22 @@ def process_single_account(browser, account, index, total, proxy_server=None):
             result_info["screenshot"] = shot
             return result_info
 
-        logger.info("找到管理入口，正在进入 VPS 控制面板...")
-        gerer_btn.first.click()
+        # 提取 href 直接导航，彻底避开任何弹窗遮挡
+        href = gerer_btn.first.get_attribute("href")
+        if href:
+            if href.startswith("/"):
+                panel_url = f"https://extranet.neoheberg.fr{href}"
+            else:
+                panel_url = href
+            logger.info(f"提取到 VPS 管理面板入口: {panel_url}，正在进入...")
+            page.goto(panel_url, wait_until="networkidle", timeout=30000)
+        else:
+            logger.info("找到管理入口，正在进入 VPS 控制面板...")
+            gerer_btn.first.click(force=True)
+            page.wait_for_load_state("networkidle", timeout=20000)
 
-        page.wait_for_load_state("networkidle", timeout=20000)
         time.sleep(2)
+        handle_gdpr_consent(page)
         panel_url = page.url
         result_info["panel_url"] = panel_url
         logger.info(f"已进入 VPS 管理详情页: {panel_url}")
@@ -569,14 +597,14 @@ def process_single_account(browser, account, index, total, proxy_server=None):
             return result_info
 
         logger.info("点击 'Redémarrer' (重启) 按钮...")
-        reboot_btn.first.click()
+        reboot_btn.first.click(force=True)
         time.sleep(1.5)
 
         # 处理二次确认弹窗
         confirm_btn = page.locator('button, a').filter(has_text=re.compile(r'(Confirmer|Valider|Oui|Yes|Confirm)', re.I))
         if confirm_btn.count() > 0 and confirm_btn.first.is_visible():
             logger.info("检测到二次确认弹窗，点击确认...")
-            confirm_btn.first.click()
+            confirm_btn.first.click(force=True)
             time.sleep(1)
 
         success_shot = f"reboot_success_{username}.png"
