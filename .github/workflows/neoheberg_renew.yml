@@ -30,11 +30,11 @@ jobs:
 
       - name: 执行登录与 VPS 重启保活任务
         env:
-          # 多账号配置: 格式支持 username:password,username2:password2 或 JSON
           NEOHEBERG_ACCOUNTS: ${{ secrets.NEOHEBERG_ACCOUNTS }}
-          # Telegram 推送配置
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          PROXY_NODE: ${{ secrets.PROXY_NODE }}
+          PROXY_URL: ${{ secrets.PROXY_URL }}
           HEADLESS: "true"
         run: |
           python neoheberg_renew.py
