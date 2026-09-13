@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-NeoHeberg VPS 自动登录与重启保活脚本 (支持多账号 + Telegram 截图推送)
+NeoHeberg VPS 自动登录与重启保活脚本 (支持多账号 + Cloudflare Turnstile 穿透 + Telegram 截图推送)
 - 登录: https://extranet.neoheberg.fr/login
+- 自动检测并穿透 Cloudflare Turnstile / Managed Challenge (5秒盾)
 - 自动处理 Cap-Widget 验证
 - 查找 VPS 并点击 "Gerer" (管理)
 - 找到 ACTIONS 中的 "Redémarrer" (重启) 并执行
@@ -41,6 +42,44 @@ DEFAULT_ACCOUNTS = [
     {"username": "xiaojieyu44m", "password": "YxJ223512@"},
     {"username": "xy137494", "password": "YxJ223512@"},
 ]
+
+# Anti-Detection Stealth Script (注入抹除自动化指纹，防止 Cloudflare 直接拦截)
+STEALTH_JS = """
+// 抹除 navigator.webdriver 指纹
+Object.defineProperty(navigator, 'webdriver', {
+    get: () => undefined
+});
+
+// 模拟 window.chrome 运行环境
+if (!window.chrome) {
+    window.chrome = {};
+}
+window.chrome.runtime = window.chrome.runtime || {
+    PlatformOs: { MAC: 'mac', WIN: 'win', ANDROID: 'android', CROS: 'cros', LINUX: 'linux', OPENBSD: 'openbsd' },
+    PlatformArch: { ARM: 'arm', X86_32: 'x86-32', X86_64: 'x86-64' },
+    PlatformNaclArch: { ARM: 'arm', X86_32: 'x86-32', X86_64: 'x86-64' }
+};
+
+// 伪造插件列表
+Object.defineProperty(navigator, 'plugins', {
+    get: () => [1, 2, 3, 4, 5]
+});
+
+// 伪造语言包
+Object.defineProperty(navigator, 'languages', {
+    get: () => ['fr-FR', 'fr', 'en-US', 'en']
+});
+
+// 伪造通知权限查询
+const origQuery = window.navigator.permissions ? window.navigator.permissions.query : null;
+if (origQuery) {
+    window.navigator.permissions.query = (parameters) => (
+        parameters.name === 'notifications' ?
+            Promise.resolve({ state: Notification.permission }) :
+            origQuery(parameters)
+    );
+}
+"""
 
 def load_accounts():
     env_accounts = os.environ.get("NEOHEBERG_ACCOUNTS", "").strip()
@@ -99,7 +138,7 @@ def send_tg_photo(photo_path, caption=""):
             files = {"photo": f}
             data = {
                 "chat_id": TG_CHAT_ID,
-                "caption": caption[:1024],  # TG 单张图文附言最大 1024 字符
+                "caption": caption[:1024],
                 "parse_mode": "HTML"
             }
             res = requests.post(url, files=files, data=data, timeout=30)
@@ -113,6 +152,91 @@ def send_tg_photo(photo_path, caption=""):
     except Exception as e:
         logger.error(f"Telegram 图片发送异常: {e}")
         return send_tg_message(caption)
+
+def is_cf_challenge_present(page):
+    """检测当前页面是否处于 Cloudflare 质询 / 5秒盾页面"""
+    try:
+        title = page.title()
+        content = page.content()
+        cf_keywords = [
+            "Vérification de sécurité en cours",
+            "Vérifiez que vous êtes humain",
+            "challenges.cloudflare.com",
+            "Just a moment...",
+            "Attention Required! | Cloudflare",
+            "Checking your browser"
+        ]
+        for kw in cf_keywords:
+            if kw in title or kw in content:
+                return True
+        for frame in page.frames:
+            if "challenges.cloudflare.com" in frame.url or "turnstile" in frame.url:
+                return True
+    except Exception:
+        pass
+    return False
+
+def handle_cloudflare_challenge(page, timeout=35):
+    """检测并尝试穿透 Cloudflare Turnstile / Managed Challenge 人机质询"""
+    if not is_cf_challenge_present(page):
+        return True
+
+    logger.info("检测到 Cloudflare Turnstile / 5 秒盾质询，正在自动尝试穿透...")
+    start_time = time.time()
+
+    while time.time() - start_time < timeout:
+        if not is_cf_challenge_present(page):
+            logger.info("Cloudflare 安全质询已通过！")
+            time.sleep(2)
+            return True
+
+        clicked = False
+        # 1. 尝试在所有 subframes 中定位并点击 Turnstile 勾选框
+        for frame in page.frames:
+            try:
+                if "cloudflare.com" in frame.url or "turnstile" in frame.url:
+                    checkbox = frame.locator('input[type="checkbox"], .ctp-checkbox-label, #challenge-stage')
+                    if checkbox.count() > 0 and checkbox.first.is_visible():
+                        box = checkbox.first.bounding_box()
+                        if box:
+                            logger.info(f"找到 Cloudflare Turnstile 勾选框，坐标 ({round(box['x'], 1)}, {round(box['y'], 1)})，正在模拟点击...")
+                            page.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2, steps=6)
+                            time.sleep(0.3)
+                            page.mouse.click(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+                        else:
+                            checkbox.first.click(timeout=3000)
+                        clicked = True
+                        time.sleep(3)
+                        break
+            except Exception as e:
+                logger.debug(f"遍历 Turnstile frame 异常: {e}")
+
+        # 2. 如果 frame 内部不可直接点击，定位主页面上的 CF iframe 容器并点击左侧复选框位置
+        if not clicked:
+            try:
+                cf_iframe = page.locator('iframe[src*="challenges.cloudflare.com"]')
+                if cf_iframe.count() > 0 and cf_iframe.first.is_visible():
+                    box = cf_iframe.first.bounding_box()
+                    if box:
+                        click_x = box["x"] + 30
+                        click_y = box["y"] + (box["height"] / 2)
+                        logger.info(f"模拟点击 Cloudflare 质询区域 ({round(click_x, 1)}, {round(click_y, 1)})...")
+                        page.mouse.move(click_x, click_y, steps=6)
+                        time.sleep(0.3)
+                        page.mouse.click(click_x, click_y)
+                        clicked = True
+                        time.sleep(3)
+            except Exception as e:
+                logger.debug(f"点击 Cloudflare 容器异常: {e}")
+
+        time.sleep(1)
+
+    if not is_cf_challenge_present(page):
+        logger.info("Cloudflare 安全质询已成功穿透！")
+        return True
+
+    logger.warning("Cloudflare 验证处理已达最大等待时间，尝试继续后续操作...")
+    return False
 
 def handle_cap_widget(page):
     """处理 NeoHeberg 登录页面的 Cap-Widget 人机验证组件"""
@@ -159,12 +283,15 @@ def process_single_account(browser, account, index, total):
     logger.info(f"[{index}/{total}] 开始处理账号: {username}")
     logger.info(f"==================================================")
 
-    # 每一个账号使用独立的上下文环境，隔离 Cookies 和 Cache
+    # 每一个账号使用独立的上下文环境，隔离 Cookies 和 Cache，并注入防指纹脚本
     context = browser.new_context(
-        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
         viewport={"width": 1366, "height": 768},
-        locale="fr-FR"
+        locale="fr-FR",
+        timezone_id="Europe/Paris"
     )
+    context.add_init_script(STEALTH_JS)
+
     page = context.new_page()
     result_info = {
         "username": username,
@@ -178,34 +305,83 @@ def process_single_account(browser, account, index, total):
     try:
         login_url = "https://extranet.neoheberg.fr/login"
         logger.info(f"正在访问登录页面: {login_url}")
-        page.goto(login_url, wait_until="networkidle", timeout=30000)
+        page.goto(login_url, wait_until="domcontentloaded", timeout=35000)
+        time.sleep(2)
 
-        if "/login" in page.url:
-            logger.info(f"输入用户名: {username}")
-            page.fill('input#email, input[name="email"]', username)
-            time.sleep(0.5)
+        # 检查初始进入是否有 CF 质询
+        handle_cloudflare_challenge(page, timeout=30)
 
-            logger.info("输入密码...")
-            page.fill('input#password, input[name="password"]', password)
-            time.sleep(0.5)
+        # 支持登录重试（若穿透 CF 后页面刷新，自动进行第二轮填写提交）
+        login_success = False
+        for attempt in range(1, 3):
+            if "/login" not in page.url:
+                login_success = True
+                break
 
+            logger.info(f"[第 {attempt}/2 次] 准备输入用户名与密码...")
+            try:
+                page.wait_for_selector('input#email, input[name="email"]', timeout=12000)
+            except PlaywrightTimeout:
+                if is_cf_challenge_present(page):
+                    handle_cloudflare_challenge(page, timeout=30)
+                    time.sleep(2)
+
+            email_input = page.locator('input#email, input[name="email"]')
+            if email_input.count() > 0 and email_input.first.is_visible():
+                logger.info(f"输入用户名: {username}")
+                email_input.first.fill(username)
+                time.sleep(0.5)
+
+            pass_input = page.locator('input#password, input[name="password"]')
+            if pass_input.count() > 0 and pass_input.first.is_visible():
+                logger.info("输入密码...")
+                pass_input.first.fill(password)
+                time.sleep(0.5)
+
+            # 触发 Cap-Widget 验证
             handle_cap_widget(page)
 
             logger.info("点击登录按钮 (Se connecter)...")
             submit_btn = page.locator('button[type="submit"]:has-text("Se connecter"), button[type="submit"]')
-            submit_btn.first.click()
+            if submit_btn.count() > 0:
+                submit_btn.first.click()
 
+            time.sleep(3)
+            # 点击登录后，如果遇到 Cloudflare 质询拦截，执行穿透处理
+            if is_cf_challenge_present(page):
+                logger.info("登录提交后触发 Cloudflare 质询，正在执行自动穿透...")
+                handle_cloudflare_challenge(page, timeout=35)
+
+            # 等待登录成功跳转
             try:
-                page.wait_for_url(lambda u: "/login" not in u, timeout=20000)
+                page.wait_for_url(lambda u: "/login" not in u, timeout=25000)
                 logger.info(f"登录成功！当前页面: {page.url}")
+                login_success = True
+                break
             except PlaywrightTimeout:
-                error_msg = page.locator('.text-red-500, .alert-danger, [role="alert"]').text_content(timeout=3000) if page.locator('.text-red-500, .alert-danger').count() > 0 else "登录超时未跳转"
-                logger.error(f"登录失败: {error_msg.strip()}")
-                fail_shot = f"login_fail_{username}.png"
-                page.screenshot(path=fail_shot)
-                result_info["message"] = f"登录失败: {error_msg.strip()}"
-                result_info["screenshot"] = fail_shot
-                return result_info
+                logger.warning(f"第 {attempt} 次提交未立即跳转，检查页面状态...")
+                if is_cf_challenge_present(page):
+                    handle_cloudflare_challenge(page, timeout=25)
+
+                if "/login" not in page.url:
+                    logger.info(f"登录成功！当前页面: {page.url}")
+                    login_success = True
+                    break
+
+                # 如果页面刷新重新出现了登录输入框，则在下一轮循环中自动重填提交
+                if page.locator('input#email, input[name="email"]').count() > 0:
+                    logger.info("检测到登录页面已刷新（可能已获取 CF clearance），进行重试...")
+                    time.sleep(1)
+                    continue
+
+        if not login_success:
+            error_msg = page.locator('.text-red-500, .alert-danger, [role="alert"]').text_content(timeout=3000) if page.locator('.text-red-500, .alert-danger').count() > 0 else "登录超时未跳转 (仍停留在登录或人机验证页)"
+            logger.error(f"登录失败: {error_msg.strip()}")
+            fail_shot = f"login_fail_{username}.png"
+            page.screenshot(path=fail_shot)
+            result_info["message"] = f"登录失败: {error_msg.strip()}"
+            result_info["screenshot"] = fail_shot
+            return result_info
 
         time.sleep(2)
 
@@ -231,7 +407,7 @@ def process_single_account(browser, account, index, total):
             result_info["screenshot"] = shot
             return result_info
 
-        logger.info(f"找到管理入口，正在进入 VPS 控制面板...")
+        logger.info("找到管理入口，正在进入 VPS 控制面板...")
         gerer_btn.first.click()
 
         page.wait_for_load_state("networkidle", timeout=20000)
@@ -302,7 +478,13 @@ def main():
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=headless,
-            args=["--no-sandbox", "--disable-blink-features=AutomationControlled"]
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-blink-features=AutomationControlled",
+                "--disable-infobars",
+                "--window-size=1366,768"
+            ]
         )
 
         for i, acc in enumerate(accounts, 1):
