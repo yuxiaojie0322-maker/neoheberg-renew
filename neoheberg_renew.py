@@ -386,6 +386,108 @@ def handle_gdpr_consent(page):
     except Exception as e:
         logger.debug(f"处理 GDPR 弹窗异常: {e}")
 
+def handle_migration_modal(page):
+    """
+    自动检测并穿透/关闭 NeoHeberg 'Extranet en cours de migration' 迁移提醒弹窗。
+    NeoHeberg 官方迁移提示弹窗包含:
+    1. 'Ouvrir le tableau de bord' (蓝底按钮，引导前往新面板 dash.neoheberg.fr)
+    2. 'Continuer sur l\'extranet' (深色按钮，留在旧版 Extranet 继续管理机器)
+    脚本优先点击 'Continuer sur l\'extranet'，并强力清理阻断操作的全屏半透明蒙层。
+    """
+    try:
+        migration_indicators = [
+            "Extranet en cours de migration",
+            "Vos services vous attendent sur le tableau de bord",
+            "Continuer sur l'extranet",
+            "Continuer sur l’extranet",
+            "dash.neoheberg.fr"
+        ]
+
+        has_modal = False
+        try:
+            page_text = page.evaluate("() => document.body ? document.body.innerText : ''")
+            if any(kw.lower() in page_text.lower() for kw in migration_indicators):
+                has_modal = True
+        except Exception:
+            pass
+
+        if not has_modal:
+            # 双重检查是否存在对应按钮
+            btn_check = page.locator('button, a').filter(has_text=re.compile(r"Continuer sur l['’]extranet", re.I))
+            if btn_check.count() > 0:
+                has_modal = True
+
+        if not has_modal:
+            return False
+
+        logger.info("📢 检测到 NeoHeberg 新面板迁移提示弹窗 (Extranet en cours de migration)！")
+
+        # 方式 1: 点击 'Continuer sur l'extranet' 按钮
+        continue_btn = page.locator('button, a').filter(has_text=re.compile(r"Continuer sur l['’]extranet", re.I))
+        if continue_btn.count() > 0:
+            logger.info("定位到 'Continuer sur l\'extranet' 按钮，正在模拟点击关闭弹窗...")
+            try:
+                continue_btn.first.click(timeout=3000)
+            except Exception:
+                continue_btn.first.click(force=True)
+            time.sleep(1.5)
+
+        # 方式 2: 按 Escape 键尝试关闭模态框
+        try:
+            page.keyboard.press("Escape")
+        except Exception:
+            pass
+
+        # 方式 3: 强力移除残留 DOM 弹窗元素与全屏半透明遮罩层 (Backdrop)，彻底恢复页面交互能力
+        page.evaluate("""() => {
+            const modalKeywords = ['Extranet en cours de migration', 'dash.neoheberg.fr', 'Continuer sur'];
+            document.querySelectorAll('div, section, aside, [role="dialog"]').forEach(el => {
+                const txt = el.textContent || '';
+                if (modalKeywords.some(k => txt.includes(k))) {
+                    let target = el;
+                    while (target && target.parentElement && target.parentElement !== document.body) {
+                        const style = window.getComputedStyle(target);
+                        if (style.position === 'fixed' || style.position === 'absolute' || target.getAttribute('role') === 'dialog') {
+                            break;
+                        }
+                        target = target.parentElement;
+                    }
+                    if (target && target.parentNode) {
+                        target.parentNode.removeChild(target);
+                    }
+                }
+            });
+
+            // 移除可能阻碍点击事件的全屏遮罩
+            document.querySelectorAll('div').forEach(el => {
+                const s = window.getComputedStyle(el);
+                if (s.position === 'fixed' && (parseInt(s.zIndex, 10) >= 30 || s.backgroundColor.includes('rgba'))) {
+                    if (el.children.length === 0 || el.innerText.trim() === '') {
+                        el.remove();
+                    }
+                }
+            });
+
+            // 恢复页面滚动条与点击指针
+            document.body.style.overflow = 'auto';
+            document.body.style.pointerEvents = 'auto';
+            if (document.documentElement) {
+                document.documentElement.style.overflow = 'auto';
+                document.documentElement.style.pointerEvents = 'auto';
+            }
+        }""")
+        time.sleep(0.5)
+        logger.info("✅ 迁移提示弹窗已自动关闭并清理，页面交互已恢复正常！")
+        return True
+    except Exception as e:
+        logger.warning(f"处理迁移提示弹窗异常: {e}")
+        return False
+
+def dismiss_all_popups(page):
+    """统一关闭页面上可能弹出的所有干扰层 (迁移弹窗、Cookie 授权等)"""
+    handle_migration_modal(page)
+    handle_gdpr_consent(page)
+
 def handle_cap_widget(page):
     """处理 NeoHeberg 登录页面的 Cap-Widget 人机验证组件"""
     logger.info("检查是否存在 Cap-Widget 人机验证...")
@@ -536,80 +638,136 @@ def process_single_account(browser, account, index, total, proxy_server=None):
             return result_info
 
         time.sleep(2)
-        handle_gdpr_consent(page)
+        dismiss_all_popups(page)
 
-        # 寻找 VPS 管理入口 (Gerer)
-        logger.info("正在查找 VPS 管理按钮 (Gerer / Gérer)...")
-        vps_tab = page.locator('div:has-text("VPS"), button:has-text("VPS"), a:has-text("VPS")').filter(has_text="VPS")
+        # 寻找 VPS 管理入口 (Gerer / Gérer)
+        logger.info("正在查找 VPS 列表与管理入口 (Gerer / Gérer)...")
+        dismiss_all_popups(page)
+
+        # 1. 优先尝试点击 VPS 分类 Tab (若页面以分类标签展示服务)
+        vps_tab = page.locator('button, a, div[role="tab"]').filter(has_text=re.compile(r'^\s*VPS\s*$', re.I))
+        if vps_tab.count() == 0:
+            vps_tab = page.locator('button:has-text("VPS"), a:has-text("VPS")')
         if vps_tab.count() > 0:
             try:
-                vps_tab.first.click(timeout=2000, force=True)
-                time.sleep(1)
-            except Exception:
-                pass
+                first_tab = vps_tab.first
+                if first_tab.is_visible():
+                    first_tab.click(timeout=3000)
+                    time.sleep(1.5)
+                    dismiss_all_popups(page)
+            except Exception as e:
+                logger.debug(f"切换 VPS 标签异常: {e}")
 
-        handle_gdpr_consent(page)
+        # 2. 智能定位目标 VPS 的管理按钮或独立面板链接
+        def get_vps_target(p):
+            # 查找具体包含 VPS 标识的链接 (必须排除单纯指向列表页的 /vps 或 /vps/)
+            candidates = p.locator('a[href*="/vps/"], a[href*="/vps?"]').all()
+            for cand in candidates:
+                href = cand.get_attribute("href") or ""
+                clean_href = href.split("?")[0].rstrip("/")
+                if clean_href and not clean_href.endswith("/vps"):
+                    return cand
 
-        gerer_btn = page.locator('a:has-text("Gerer"), button:has-text("Gerer"), a:has-text("Gérer"), button:has-text("Gérer"), [href*="/vps/"]')
-        if gerer_btn.count() == 0:
-            gerer_btn = page.locator('.fa-cog, .fa-gear').locator('..')
+            # 查找包含 "Gérer" / "Gerer" 的按钮或超链接
+            gerer_loc = p.locator('a:has-text("Gérer"), button:has-text("Gérer"), a:has-text("Gerer"), button:has-text("Gerer")')
+            if gerer_loc.count() > 0:
+                return gerer_loc.first
 
-        if gerer_btn.count() == 0:
-            logger.error("未找到任何 VPS 的 Gerer 管理按钮")
+            # 查找操作列设置图标
+            cog = p.locator('.fa-cog, .fa-gear').locator('..')
+            if cog.count() > 0:
+                return cog.first
+
+            return None
+
+        gerer_btn = get_vps_target(page)
+
+        # 若主页未直接找到且尚未在 /vps 页面，尝试直接跳转至 VPS 列表页
+        if not gerer_btn and not page.url.rstrip("/").endswith("/vps"):
+            logger.info("主页未直接发现 VPS 实例管理按钮，尝试直接进入 VPS 列表页: https://extranet.neoheberg.fr/vps ...")
+            try:
+                page.goto("https://extranet.neoheberg.fr/vps", wait_until="domcontentloaded", timeout=25000)
+                time.sleep(2)
+                dismiss_all_popups(page)
+                gerer_btn = get_vps_target(page)
+            except Exception as e:
+                logger.debug(f"直接跳转 /vps 页面异常: {e}")
+
+        if not gerer_btn:
+            logger.error("未找到任何可用 VPS 的管理入口 (Gerer)")
+            dismiss_all_popups(page)
             shot = f"no_vps_{username}.png"
             page.screenshot(path=shot)
-            result_info["message"] = "未找到 VPS 管理按钮"
+            result_info["message"] = "未找到 VPS 管理按钮 (页面可能已被迁移弹窗遮挡或无有效机器)"
             result_info["screenshot"] = shot
             return result_info
 
-        # 提取 href 直接导航，彻底避开任何弹窗遮挡
-        href = gerer_btn.first.get_attribute("href")
-        if href:
+        # 提取 href 直接导航进入 VPS 详情控制台
+        href = gerer_btn.get_attribute("href")
+        if href and (href.startswith("/") or href.startswith("http")):
             if href.startswith("/"):
                 panel_url = f"https://extranet.neoheberg.fr{href}"
             else:
                 panel_url = href
             logger.info(f"提取到 VPS 管理面板入口: {panel_url}，正在进入...")
-            page.goto(panel_url, wait_until="networkidle", timeout=30000)
+            page.goto(panel_url, wait_until="domcontentloaded", timeout=30000)
         else:
-            logger.info("找到管理入口，正在进入 VPS 控制面板...")
-            gerer_btn.first.click(force=True)
-            page.wait_for_load_state("networkidle", timeout=20000)
+            logger.info("找到管理入口，正在点击进入 VPS 控制面板...")
+            gerer_btn.click()
+            page.wait_for_load_state("domcontentloaded", timeout=20000)
 
         time.sleep(2)
-        handle_gdpr_consent(page)
+        dismiss_all_popups(page)
         panel_url = page.url
         result_info["panel_url"] = panel_url
-        logger.info(f"已进入 VPS 管理详情页: {panel_url}")
+        logger.info(f"已成功进入 VPS 管理详情页: {panel_url}")
 
-        # 查找 ACTIONS 中的 "Redémarrer" (重启) 按钮
-        logger.info("正在查找 ACTIONS 区域中的 'Redémarrer' (重启) 按钮...")
-        reboot_btn = page.locator('button:has-text("Redémarrer"), a:has-text("Redémarrer"), button:has-text("Redemarrer"), a:has-text("Redemarrer"), [title*="Redémarrer"]')
+        # 查找 ACTIONS 区域中的 "Redémarrer" (重启) 按钮
+        logger.info("正在查找 VPS 详情页中的 'Redémarrer' (重启) 按钮...")
+        dismiss_all_popups(page)
+
+        # 优先通过文字精准匹配重启操作 (避免误点表格自带的刷新列表按钮)
+        reboot_btn = page.locator('button, a').filter(has_text=re.compile(r'^\s*(Redémarrer|Redemarrer|Reboot)\s*$', re.I))
         if reboot_btn.count() == 0:
-            reboot_btn = page.locator('button:has(.fa-sync), button:has(.fa-redo), button:has(.fa-rotate-right)')
+            reboot_btn = page.locator('button:has-text("Redémarrer"), a:has-text("Redémarrer"), button:has-text("Redemarrer"), a:has-text("Redemarrer"), [title*="Redémarrer" i], [title*="Redemarrer" i]')
+        if reboot_btn.count() == 0:
+            # 仅在明确标有 ACTIONS 或电源控制的作用域内匹配重启图标
+            reboot_btn = page.locator('.actions button:has(.fa-sync), .actions button:has(.fa-redo), div:has-text("Actions") button:has(.fa-sync), div:has-text("ACTIONS") button:has(.fa-redo)')
 
         if reboot_btn.count() == 0:
-            logger.error("未找到 'Redémarrer' 重启按钮")
+            logger.error("未找到 'Redémarrer' 重启按钮，请确认页面是否已成功进入 VPS 控制台")
+            dismiss_all_popups(page)
             shot = f"no_reboot_{username}.png"
             page.screenshot(path=shot)
             result_info["message"] = "未找到 Redémarrer 重启按钮"
             result_info["screenshot"] = shot
             return result_info
 
-        logger.info("点击 'Redémarrer' (重启) 按钮...")
-        reboot_btn.first.click(force=True)
+        logger.info("找到重启按钮，正在滚动至可视区域并点击...")
+        dismiss_all_popups(page)
+        try:
+            reboot_btn.first.scroll_into_view_if_needed(timeout=3000)
+        except Exception:
+            pass
+        reboot_btn.first.click()
         time.sleep(1.5)
 
-        # 处理二次确认弹窗
-        confirm_btn = page.locator('button, a').filter(has_text=re.compile(r'(Confirmer|Valider|Oui|Yes|Confirm)', re.I))
+        # 处理二次确认弹窗 (Confirmer / Valider / Oui / Yes / Confirm)
+        confirm_btn = page.locator('button, a').filter(has_text=re.compile(r'^\s*(Confirmer|Valider|Oui|Yes|Confirm)\s*$', re.I))
+        if confirm_btn.count() == 0:
+            confirm_btn = page.locator('.modal button:has-text("Confirmer"), .modal button:has-text("Redémarrer"), [role="dialog"] button:has-text("Confirmer"), [role="dialog"] button:has-text("Oui")')
         if confirm_btn.count() > 0 and confirm_btn.first.is_visible():
-            logger.info("检测到二次确认弹窗，点击确认...")
-            confirm_btn.first.click(force=True)
-            time.sleep(1)
+            logger.info("检测到二次确认弹窗，正在点击确认重启...")
+            confirm_btn.first.click()
+            time.sleep(2)
+
+        # 再次确保弹窗与遮罩层被彻底清除，保证截图呈现真实控制台状态
+        dismiss_all_popups(page)
+        time.sleep(2)
 
         success_shot = f"reboot_success_{username}.png"
         page.screenshot(path=success_shot)
-        logger.info(f"✅ 账号 {username} 的 VPS 已成功重启！截图保存至: {success_shot}")
+        logger.info(f"✅ 账号 {username} 的 VPS 重启指令已成功执行！真实控制台截图保存至: {success_shot}")
 
         result_info["status"] = "SUCCESS"
         result_info["message"] = "VPS 重启指令下发成功"
@@ -708,6 +866,7 @@ def main():
     msg_lines.append("──────────────────")
     msg_lines.append(f"📈 <b>汇总</b>: 成功 {len(success_list)} 个 | 失败 {len(fail_list)} 个")
     msg_lines.append(f"⏰ <b>完成时间</b>: {now_time}")
+    msg_lines.append("💡 <i>提示: 官方正推进新面板迁移 (dash.neoheberg.fr)，脚本已自动穿透弹窗确保旧 Extranet 机器正常重启保活</i>")
 
     tg_summary = "\n".join(msg_lines)
     send_tg_message(tg_summary)

@@ -6,10 +6,11 @@
 
 ## 📌 支持的特性
 - **多账号批量轮询**：账号间环境严格隔离（Independent Context），互不干扰。
-- **自动处理 Cap-Widget 验证**：处理登录页面的 Axel L 验证组件。
-- **智能定位元素**：自动匹配 `Gerer` / `Gérer` 按钮与 ACTIONS 中的 `Redémarrer` 重启按钮。
+- **自动穿透 Extranet 迁移弹窗**：自动识别并关闭 `Extranet en cours de migration`（提示迁移至 dash.neoheberg.fr）全屏提示框与遮罩层，防止界面被遮挡导致误判与漏操作。
+- **自动处理 Cap-Widget / Cloudflare 验证**：处理登录页面的人机验证组件与 5 秒盾质询。
+- **智能定位元素**：自动匹配 `Gerer` / `Gérer` 按钮与 ACTIONS 中的 `Redémarrer` 重启按钮，防误触列表刷新按钮。
 - **自动确认弹窗**：如遇二次确认提示自动处理。
-- **Telegram 推送**：每次运行结束自动推送美化卡片消息，并附带 VPS 仪表盘实时操作截图。
+- **Telegram 推送**：每次运行结束自动推送美化卡片消息，并附带真实 VPS 仪表盘实时操作截图。
 - **运行快照留存**：每次运行均会保存结果截图（如 `reboot_success_username.png`），方便核验。
 - **全自动无人值守**：配套 GitHub Actions 工作流，每 3 天自动定时运行，无需电脑开机。
 
