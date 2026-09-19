@@ -17,19 +17,24 @@ jobs:
     timeout-minutes: 20
 
     steps:
-      - name: 检出仓库代码
+      - name: 检出私有核心仓库
         uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/my-private-scripts
+          path: private-scripts
+          token: ${{ secrets.CORE_SCRIPT_TOKEN || secrets.REPO_TOKEN || secrets.GH_PAT_PRIVATE_REPO }}
 
       - name: 设置 Python 环境
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
+          cache-dependency-path: private-scripts/neoheberg/requirements.txt
 
       - name: 安装依赖
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install -r private-scripts/neoheberg/requirements.txt
           playwright install --with-deps chromium
 
       - name: 执行登录与 VPS 重启保活任务
@@ -41,7 +46,7 @@ jobs:
           PROXY_URL: ${{ secrets.PROXY_URL }}
           HEADLESS: "true"
         run: |
-          python neoheberg_renew.py
+          python -u private-scripts/neoheberg/neoheberg_renew.py
 
       - name: 上传执行截图快照 (可供排查与确认)
         if: always()

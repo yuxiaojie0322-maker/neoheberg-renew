@@ -1,10 +1,13 @@
-# NeoHeberg VPS 自动登录与重启保活脚本
+# 🚀 NeoHeberg VPS 自动登录与重启保活工作流
 
-基于 **Playwright** 自动化框架开发，专门用于自动登录 [NeoHeberg Extranet](https://extranet.neoheberg.fr/login)，穿透人机验证组件，进入 VPS 管理面板（`Gerer`）并触发重启（`Redémarrer`）以维持机器与账号的活跃度。运行完成后支持通过 **Telegram Bot 发送带截图的运行报告**。
+公开运行 GitHub Actions 工作流，核心运行脚本存放于统一私有仓库 `my-private-scripts/neoheberg` 中。
+基于 **Playwright** 自动化框架开发，专门用于自动登录 [NeoHeberg Extranet](https://extranet.neoheberg.fr/login)，穿透人机验证与新面板迁移提示弹窗，进入 VPS 管理面板并触发重启（`Redémarrer`）以维持机器与账号的活跃度。运行完成后支持通过 **Telegram Bot 发送带真实截图的运行报告**。
 
 ---
 
 ## 📌 支持的特性
+
+- **核心代码私有化隔离**：核心脚本集中存放于 `my-private-scripts`，保障代码与默认配置私密安全。
 - **多账号批量轮询**：账号间环境严格隔离（Independent Context），互不干扰。
 - **自动穿透 Extranet 迁移弹窗**：自动识别并关闭 `Extranet en cours de migration`（提示迁移至 dash.neoheberg.fr）全屏提示框与遮罩层，防止界面被遮挡导致误判与漏操作。
 - **自动处理 Cap-Widget / Cloudflare 验证**：处理登录页面的人机验证组件与 5 秒盾质询。
@@ -22,7 +25,9 @@
 
 | Secret 变量名 | 必填 | 示例 / 说明 |
 | :--- | :--- | :--- |
-| `NEOHEBERG_ACCOUNTS` | 选填 | 多个账号（格式为 `账号:密码,账号2:密码2`）。若未设置则默认使用代码内置账号 |
+| `CORE_SCRIPT_TOKEN` 或 `REPO_TOKEN` | 必填 | 具备读取私有仓库 `my-private-scripts` 权限的 GitHub Personal Access Token (PAT) |
+| `NEOHEBERG_ACCOUNTS` | 选填 | 多个账号（格式为 `账号:密码,账号2:密码2`）。若未设置则默认使用私有核心代码内置账号 |
+| `PROXY_NODE` / `PROXY_URL` | 选填 | 代理节点链接（支持 Hysteria2、Vless、Socks5、HTTP）。若未设置则使用内置节点 |
 | `TG_BOT_TOKEN` | 选填 | 你的 Telegram Bot Token（如 `123456789:ABCdefGhI...`） |
 | `TG_CHAT_ID` | 选填 | 你的 Telegram 用户 ID 或频道/群组 ID（如 `987654321`） |
 
@@ -30,20 +35,7 @@
 
 ## 🚀 部署运行方法
 
-### 方案 A：GitHub Actions 自动定时运行（最推荐，免开机）
+### GitHub Actions 自动定时运行（最推荐，免开机）
 1. 在仓库顶部的 **Actions** 标签页，点击 `NeoHeberg Auto Reboot & Keepalive`；
 2. 点击 **Run workflow** 即可随时手动测试执行；
 3. **定时执行**：默认配置为每 3 天自动执行一次。执行完成后 Telegram 会立刻收到通知！
-
----
-
-### 方案 B：本地电脑运行
-1. 安装依赖：
-   ```bash
-   pip install -r requirements.txt
-   playwright install chromium
-   ```
-2. 运行脚本：
-   ```bash
-   python neoheberg_renew.py
-   ```
