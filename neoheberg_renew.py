@@ -3,13 +3,12 @@
 """
 NeoHeberg VPS 自动登录与重启保活脚本
 - 登录地址: https://dash.neoheberg.fr/login (适配全新 NeoHeberg 仪表盘)
+- 集成 Stealth 反爬指纹绕过与 Cloudflare Turnstile 5 秒盾自动穿透
 - 两步登录自动化 (Identifiant -> Mot de passe)
 - 自动穿透 Axel-L Cap-Widget 人机验证 (PoW 自动求解与触发)
-- 自动进入控制台并点击 "Redémarrer" (重启服务器) 保持账号与机器活跃
-- 支持弹窗遮罩自动清理与二次确认弹窗处理
+- 自动进入控制台并点击 "Redémarrer" (重启服务器) 保持机器与账号活跃度
 - 支持多账号轮询 (独立 Session / Context 隔离)
 - 支持 Telegram Bot 实时图文与仪表盘全屏截图推送
-- 适配 GitHub Actions 定时与手动触发运行
 """
 
 import os
@@ -119,11 +118,8 @@ def clean_overlays_and_alerts(page):
     """清理页面干扰项、通知弹窗与 Cookie 提示"""
     try:
         page.evaluate("""() => {
-            // 关闭 alert 提示
             document.querySelectorAll('[data-action="dismiss-alert"], .alert-card button').forEach(b => b.click());
-            // 关闭模态遮罩
             document.querySelectorAll('[data-action="close-modal"]').forEach(b => b.click());
-            // 关闭通用 cookie 弹窗
             const btns = Array.from(document.querySelectorAll('button, a'));
             btns.forEach(b => {
                 const text = (b.innerText || '').toLowerCase();
@@ -134,6 +130,57 @@ def clean_overlays_and_alerts(page):
         }""")
     except Exception:
         pass
+
+def try_pass_cloudflare_turnstile(page, max_wait_sec=25):
+    """检测并尝试穿透 Cloudflare 5 秒盾与 Turnstile 验证组件"""
+    for _ in range(max_wait_sec):
+        title = (page.title() or "").lower()
+        content = (page.content() or "").lower()
+
+        # 检查是否处于 Cloudflare 质询状态
+        is_cf = (
+            "cloudflare" in title
+            or "just a moment" in title
+            or "vérification de sécurité" in title
+            or "challenges.cloudflare.com" in content
+            or "cf-turnstile" in content
+        )
+
+        if not is_cf:
+            # 已经脱离 Cloudflare 盾页面
+            return True
+
+        logger.info("🛡️ 正在尝试穿透 Cloudflare Turnstile 验证框...")
+
+        # 1. 尝试在所有 Frame 中寻找 checkbox
+        for frame in page.frames:
+            try:
+                chk = frame.locator("input[type='checkbox'], span.mark, .ctp-checkbox-label, #challenge-stage")
+                if chk.count() > 0 and chk.first.is_visible():
+                    chk.first.click(timeout=1500)
+                    logger.info("👆 已点击 Frame 内的 Turnstile 复选框")
+                    time.sleep(2)
+                    break
+            except Exception:
+                pass
+
+        # 2. 模拟鼠标点击 Turnstile iframe 的复选框中心偏左区域
+        for sel in ["iframe[src*='challenges.cloudflare.com']", "iframe[src*='turnstile']", "iframe[title*='Cloudflare']"]:
+            try:
+                cf_frame = page.locator(sel)
+                if cf_frame.count() > 0 and cf_frame.first.is_visible():
+                    box = cf_frame.first.bounding_box()
+                    if box:
+                        page.mouse.click(box["x"] + 28, box["y"] + box["height"] / 2)
+                        logger.info("👆 模拟鼠标点击 Turnstile 区域")
+                        time.sleep(2)
+                        break
+            except Exception:
+                pass
+
+        time.sleep(1)
+
+    return False
 
 def solve_dash_cap_widget(page):
     """
@@ -188,8 +235,38 @@ def solve_dash_cap_widget(page):
         logger.warning(f"Cap-Widget 处理过程出现提示: {e}")
     return True
 
+def apply_stealth_scripts(context):
+    """注入反检测特征脚本，消除 automation controlled 标志"""
+    context.add_init_script("""
+        // 伪装 navigator.webdriver
+        Object.defineProperty(navigator, 'webdriver', {
+            get: () => false
+        });
+        // 伪装语言与插件
+        Object.defineProperty(navigator, 'languages', {
+            get: () => ['fr-FR', 'fr', 'en-US', 'en']
+        });
+        Object.defineProperty(navigator, 'plugins', {
+            get: () => [1, 2, 3, 4, 5]
+        });
+        // 伪装 chrome 对象
+        window.chrome = {
+            runtime: {},
+            loadTimes: function() {},
+            csi: function() {},
+            app: {}
+        };
+        // 伪装 permissions
+        const originalQuery = window.navigator.permissions.query;
+        window.navigator.permissions.query = (parameters) => (
+            parameters.name === 'notifications' ?
+                Promise.resolve({ state: Notification.permission }) :
+                originalQuery(parameters)
+        );
+    """)
+
 def process_single_account(browser, account, index, total):
-    """处理单个 NeoHeberg 账号的登录与 VPS 重启任务"""
+    """处理单个 NeoHeberg 账号的登录与 VPS 重启任务 (带自动重试机制)"""
     username = account.get("username", "").strip()
     password = account.get("password", "").strip()
     start_time = time.time()
@@ -204,7 +281,16 @@ def process_single_account(browser, account, index, total):
         viewport={"width": 1440, "height": 900},
         locale="fr-FR"
     )
+    apply_stealth_scripts(context)
+
     page = context.new_page()
+
+    # 尝试加载 playwright_stealth
+    try:
+        from playwright_stealth import stealth_sync
+        stealth_sync(page)
+    except Exception:
+        pass
 
     result_info = {
         "username": username,
@@ -217,61 +303,90 @@ def process_single_account(browser, account, index, total):
 
     try:
         login_url = "https://dash.neoheberg.fr/login"
-        logger.info(f"🌐 访问 NeoHeberg 登录页面: {login_url}")
-        page.goto(login_url, wait_until="domcontentloaded", timeout=35000)
-        time.sleep(2)
+        logged_in = False
 
-        # 检查是否已经在登录页面
-        if "/login" in page.url:
-            # 步骤 1: 填写用户名/邮箱并点击 Continuer (两步式登录)
-            logger.info(f"✍️ [第 1 步] 填写 Identifiant: {username}")
-            id_input = page.locator('input#identifier, input[name="identifier"]')
-            id_input.wait_for(state="visible", timeout=15000)
-            id_input.fill(username)
-            time.sleep(0.5)
+        # 登录重试循环（支持 Cloudflare 质询穿透与 Cookie 保持重试）
+        for attempt in range(1, 4):
+            logger.info(f"🌐 [第 {attempt}/3 次尝试] 访问 NeoHeberg 登录页面: {login_url}")
+            page.goto(login_url, wait_until="domcontentloaded", timeout=35000)
+            time.sleep(2)
 
-            continue_btn = page.locator('button#goToPassword, button:has-text("Continuer")')
-            if continue_btn.count() > 0 and continue_btn.first.is_visible():
-                logger.info("👉 点击 'Continuer' 进入密码输入步骤...")
-                continue_btn.first.click()
-            else:
-                id_input.press("Enter")
+            # 检查是否有前置 Cloudflare 盾
+            try_pass_cloudflare_turnstile(page, max_wait_sec=15)
 
-            # 等待步骤 2 密码区域显示
-            time.sleep(1)
-            pw_input = page.locator('input#password, input[name="password"]')
-            pw_input.wait_for(state="visible", timeout=10000)
+            # 检查是否已直接处于已登录页面
+            if page.locator(':text("Mes services"), :text("Tableau de bord"), a:has-text("Déconnexion")').count() > 0:
+                logger.info("🎉 识别到后台核心组件，当前已处于登录态！")
+                logged_in = True
+                break
 
-            # 步骤 2: 填写密码并处理验证码
-            logger.info("🔒 [第 2 步] 填写密码...")
-            pw_input.fill(password)
-            time.sleep(0.5)
+            if "/login" in page.url or page.locator('#identifier, input[name="identifier"]').count() > 0:
+                # 步骤 1: 填写用户名/邮箱并点击 Continuer (两步式登录)
+                logger.info(f"✍️ [第 1 步] 填写 Identifiant: {username}")
+                id_input = page.locator('input#identifier, input[name="identifier"]')
+                id_input.wait_for(state="visible", timeout=15000)
+                id_input.fill(username)
+                time.sleep(0.5)
 
-            # 处理人机验证
-            solve_dash_cap_widget(page)
+                continue_btn = page.locator('button#goToPassword, button:has-text("Continuer")')
+                if continue_btn.count() > 0 and continue_btn.first.is_visible():
+                    logger.info("👉 点击 'Continuer' 进入密码输入步骤...")
+                    continue_btn.first.click()
+                else:
+                    id_input.press("Enter")
 
-            # 点击登录提交按钮
-            logger.info("🚀 提交登录表单 (Se connecter)...")
-            submit_btn = page.locator('form.login-form button[type="submit"], button:has-text("Se connecter")')
-            submit_btn.first.click()
+                # 等待步骤 2 密码区域显示
+                time.sleep(1)
+                pw_input = page.locator('input#password, input[name="password"]')
+                pw_input.wait_for(state="visible", timeout=10000)
 
-            # 等待跳转离开登录页
-            try:
-                page.wait_for_url(lambda u: "/login" not in u, timeout=30000)
-                logger.info(f"🎉 登录成功！当前控制台页面: {page.url}")
-            except PlaywrightTimeout:
-                err_text = ""
-                err_loc = page.locator('#identifierError, #loginCaptchaError, .text-red-400, .alert-card')
-                if err_loc.count() > 0:
-                    err_text = " | ".join([t.strip() for t in err_loc.all_text_contents() if t.strip()])
-                if not err_text:
-                    err_text = "登录超时未能跳转到控制台"
-                logger.error(f"❌ 登录失败: {err_text}")
-                fail_shot = f"login_fail_{username}.png"
-                page.screenshot(path=fail_shot, full_page=True)
-                result_info["message"] = f"登录失败: {err_text}"
-                result_info["screenshot"] = fail_shot
-                return result_info
+                # 步骤 2: 填写密码并处理验证码
+                logger.info("🔒 [第 2 步] 填写密码...")
+                pw_input.fill(password)
+                time.sleep(0.5)
+
+                # 处理人机验证
+                solve_dash_cap_widget(page)
+
+                # 点击登录提交按钮
+                logger.info("🚀 提交登录表单 (Se connecter)...")
+                submit_btn = page.locator('form.login-form button[type="submit"], button:has-text("Se connecter")')
+                submit_btn.first.click()
+
+                # 提交后可能触发 Cloudflare Turnstile 质询盾，给予检测与穿透
+                logger.info("⏳ 表单已提交，监测登录跳转与 Cloudflare 质询状态...")
+                for w in range(35):
+                    time.sleep(1)
+
+                    # 1. 检测是否已成功登录（出现 Mes services、Tableau de bord、Déconnexion）
+                    if page.locator(':text("Mes services"), :text("Tableau de bord"), a:has-text("Déconnexion"), [data-action="logout"]').count() > 0:
+                        logger.info(f"🎉 登录成功！当前控制台页面: {page.url}")
+                        logged_in = True
+                        break
+
+                    # 2. 检测并穿透 Cloudflare Turnstile
+                    try_pass_cloudflare_turnstile(page, max_wait_sec=3)
+
+                    # 3. 检测是否有明显的错误提示
+                    err_loc = page.locator('#identifierError, #loginCaptchaError, .text-red-400')
+                    if err_loc.count() > 0 and err_loc.first.is_visible():
+                        err_text = err_loc.first.text_content().strip()
+                        if err_text:
+                            logger.warning(f"⚠️ 登录提示: {err_text}")
+
+                if logged_in:
+                    break
+
+            time.sleep(2)
+
+        if not logged_in:
+            err_text = "登录未能成功跳转到后台控制台"
+            logger.error(f"❌ 账号 {username} 最终登录失败")
+            fail_shot = f"login_fail_{username}.png"
+            page.screenshot(path=fail_shot, full_page=True)
+            result_info["message"] = err_text
+            result_info["screenshot"] = fail_shot
+            return result_info
 
         # 登录成功，进入主界面后休眠等待动态内容加载
         time.sleep(3)
@@ -333,7 +448,7 @@ def process_single_account(browser, account, index, total):
             time.sleep(2)
 
         # 等待重启指令下发与页面状态响应
-        time.sleep(4)
+        time.sleep(5)
         clean_overlays_and_alerts(page)
 
         # 截取重启成功操作凭证截图
@@ -381,7 +496,8 @@ def main():
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
                 "--disable-blink-features=AutomationControlled",
-                "--disable-infobars"
+                "--disable-infobars",
+                "--window-size=1440,900"
             ]
         )
 
@@ -389,7 +505,7 @@ def main():
             res = process_single_account(browser, acc, i, len(accounts))
             results.append(res)
             if i < len(accounts):
-                time.sleep(5)  # 多账号安全缓冲
+                time.sleep(5)
 
         browser.close()
 
