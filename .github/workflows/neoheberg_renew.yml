@@ -35,6 +35,9 @@ jobs:
       - name: 执行登录与 VPS 重启保活任务
         env:
           NEOHEBERG_ACCOUNTS: ${{ secrets.NEOHEBERG_ACCOUNTS }}
+          PROXY_NODE: ${{ secrets.PROXY_NODE }}
+          NODE_LINK: ${{ secrets.NODE_LINK }}
+          PROXY_URL: ${{ secrets.PROXY_URL }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           HEADLESS: "true"
