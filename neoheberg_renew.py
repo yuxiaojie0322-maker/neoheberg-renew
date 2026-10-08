@@ -7,9 +7,10 @@ NeoHeberg VPS 自动登录与重启保活脚本
 - 集成 sing-box 本地代理中间件 (自适应 Hysteria2 / VMess / VLESS / TUIC / Trojan / SOCKS5 / HTTP)
 - 两步登录自动化 (Identifiant -> Mot de passe)
 - 自动穿透 Axel-L Cap-Widget 人机验证 (PoW 自动求解与触发)
-- 自动进入控制台并点击 "Redémarrer" (重启服务器) 保持机器与账号活跃度
+- 自动处理 Google GDPR Consent 弹窗 (Autoriser / Refuser) 并彻底消除浮层遮罩
+- 自动定位 [data-vps-power="reboot"] (Redémarrer) 并完成服务器重启与保活
 - 支持多账号轮询 (独立 Session / Context 隔离)
-- 支持 Telegram Bot 实时图文与仪表盘全屏截图推送
+- 支持 Telegram Bot 实时图文与仪表盘全屏截图推送 (HTML 实体转义安全保护)
 """
 
 import os
@@ -19,6 +20,7 @@ import json
 import logging
 import datetime
 import re
+import html
 import base64
 import urllib.parse
 import subprocess
@@ -266,7 +268,6 @@ def start_proxy(listen_port=10808):
     启动本地 sing-box 代理进程，将代理节点转换为本地 SOCKS5/HTTP 混合端口
     返回本地代理 URL（如 'http://127.0.0.1:10808'）供 Playwright 使用
     """
-    # 候选节点列表
     node_candidates = []
     env_node = (os.environ.get("PROXY_NODE") or os.environ.get("NODE_LINK") or os.environ.get("PROXY_URL") or "").strip()
     if env_node:
@@ -274,7 +275,6 @@ def start_proxy(listen_port=10808):
     node_candidates.append(DEFAULT_HY2_NODE)
     node_candidates.append(DEFAULT_VMESS_NODE)
 
-    # 检查平台二进制
     singbox_bin = "./sing-box"
     if sys.platform.startswith("linux"):
         if not os.path.exists(singbox_bin):
@@ -326,7 +326,6 @@ def start_proxy(listen_port=10808):
             proc = subprocess.Popen([singbox_bin, "run", "-c", config_file], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             time.sleep(3)
 
-            # 测试代理连通性并获取出口 IP
             local_proxy = f"http://127.0.0.1:{listen_port}"
             try:
                 res = requests.get(
@@ -338,7 +337,7 @@ def start_proxy(listen_port=10808):
                 logger.info(f"✨ 代理连通成功！节点出口 IP: {out_ip}")
                 return local_proxy
             except Exception as e:
-                logger.warning(f"⚠️ 节点 [{idx}] 连通测试失败 ({e})，尝试终止并切换下一候选节点...")
+                logger.warning(f"⚠️ 节点 [{idx}] 连通测试失败 ({e})，尝试切换下一候选节点...")
                 proc.terminate()
                 time.sleep(1)
 
@@ -421,12 +420,25 @@ def send_tg_photo(photo_path, caption=""):
         logger.error(f"❌ Telegram 图片发送异常: {e}")
         return send_tg_message(caption)
 
-def clean_overlays_and_alerts(page):
-    """清理页面干扰项、通知弹窗与 Cookie 提示"""
+def dismiss_gdpr_and_overlays(page):
+    """清理 Google GDPR Consent 弹窗、通知浮层与遮罩"""
     try:
+        # 1. 尝试点击 'Autoriser' 或 'Refuser' 或 'Accepter'
+        for text in ["Autoriser", "Refuser", "Accepter", "Consent"]:
+            btn = page.locator(f'.fc-consent-root button:has-text("{text}"), button:has-text("{text}")')
+            if btn.count() > 0 and btn.first.is_visible():
+                logger.info(f"👉 点击 GDPR 弹窗按钮: {text}")
+                try:
+                    btn.first.click(timeout=2000, force=True)
+                except Exception:
+                    pass
+                time.sleep(1)
+                break
+
+        # 2. 彻底从 DOM 中移除任何残留的遮罩层，确保不会拦截点击
         page.evaluate("""() => {
-            document.querySelectorAll('[data-action="dismiss-alert"], .alert-card button').forEach(b => b.click());
-            document.querySelectorAll('[data-action="close-modal"]').forEach(b => b.click());
+            document.querySelectorAll('.fc-consent-root, .fc-dialog-overlay, .modal-backdrop, [data-action="dismiss-alert"]').forEach(el => el.remove());
+            document.body.style.overflow = 'auto';
             const btns = Array.from(document.querySelectorAll('button, a'));
             btns.forEach(b => {
                 const text = (b.innerText || '').toLowerCase();
@@ -435,8 +447,8 @@ def clean_overlays_and_alerts(page):
                 }
             });
         }""")
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"清理浮层提示: {e}")
 
 def cdp_native_click(cdp_session, x, y):
     """利用 CDP 发送真实的操作系统级硬件鼠标点击事件"""
@@ -487,7 +499,6 @@ def try_click_cloudflare(page, cdp_session):
 
     logger.info(f"🛡️ 检测到 Cloudflare 验证盾 (标题: '{page.title()}')，正在尝试穿透...")
 
-    # 1. 尝试直接点击 Frame 内的复选框
     for frame in page.frames:
         try:
             chk = frame.locator("input[type='checkbox'], span.mark, .ctp-checkbox-label, #challenge-stage")
@@ -499,7 +510,6 @@ def try_click_cloudflare(page, cdp_session):
         except Exception:
             pass
 
-    # 2. 获取页面中 Cloudflare 舞台或 iframe 的几何坐标
     found_geom = False
     try:
         iframes = page.locator("iframe")
@@ -517,7 +527,6 @@ def try_click_cloudflare(page, cdp_session):
     except Exception:
         pass
 
-    # 3. 若 DOM 中尚未暴露 iframe，直接通过已知的标准视口坐标触发 CDP 硬件级点击
     if not found_geom:
         logger.info("👆 触发 CDP 视口基准坐标硬件点击: (294, 372)...")
         cdp_native_click(cdp_session, 294, 372)
@@ -730,9 +739,9 @@ def process_single_account(browser, account, index, total, proxy_server=None):
             result_info["screenshot"] = fail_shot
             return result_info
 
-        # 登录成功，进入主界面后休眠等待动态内容加载
+        # 登录成功，进入主界面后等待并清理 GDPR 授权弹窗
         time.sleep(3)
-        clean_overlays_and_alerts(page)
+        dismiss_gdpr_and_overlays(page)
         result_info["panel_url"] = page.url
 
         # ==================== 执行 VPS 重启操作 ====================
@@ -740,34 +749,63 @@ def process_single_account(browser, account, index, total, proxy_server=None):
 
         reboot_clicked = False
 
-        # 方式 1: 直接在当前页面（Tableau de bord / Mes services）寻找 Redémarrer 按钮
-        reboot_locators = page.locator('button, a').filter(has_text=re.compile(r'Red[eé]marrer', re.I))
-        if reboot_locators.count() > 0 and reboot_locators.first.is_visible():
-            logger.info("🎯 在主面板服务列表中直接找到 'Redémarrer' 重启按钮，准备点击...")
-            reboot_locators.first.click()
-            reboot_clicked = True
+        # 再次确保弹窗与遮罩层被彻底清除
+        dismiss_gdpr_and_overlays(page)
+        time.sleep(1)
+
+        # 方式 1: 直接优先匹配 [data-vps-power="reboot"] 按钮
+        reboot_locators = page.locator('button[data-vps-power="reboot"], [data-vps-power="reboot"]')
+        if reboot_locators.count() == 0:
+            reboot_locators = page.locator('button, a').filter(has_text=re.compile(r'Red[eé]marrer', re.I))
+
+        if reboot_locators.count() > 0:
+            logger.info("🎯 在主面板中精准找到 'Redémarrer' (data-vps-power=reboot) 按钮，触发点击...")
+            try:
+                # 优先使用 DOM 原生派发点击，无视任何上层遮罩
+                page.evaluate("""() => {
+                    const btn = document.querySelector('[data-vps-power="reboot"]') || 
+                                Array.from(document.querySelectorAll('button, a')).find(el => (el.innerText || '').toLowerCase().includes('redémarrer') || (el.innerText || '').toLowerCase().includes('redemarrer'));
+                    if (btn) btn.click();
+                }""")
+                reboot_clicked = True
+                logger.info("👉 已通过 DOM 派发原生点击事件")
+            except Exception as e:
+                logger.warning(f"原生点击异常: {e}")
+
+            if not reboot_clicked:
+                try:
+                    reboot_locators.first.click(force=True, timeout=5000)
+                    reboot_clicked = True
+                    logger.info("👉 已通过 Playwright force click 触发点击")
+                except Exception as e:
+                    logger.warning(f"force click 提示: {e}")
+
         else:
-            # 方式 2: 点击 'Gérer le VPS' 进入 VPS 专属管理面板
+            # 方式 2: 点击 'Gérer le VPS' 进入 VPS 专属管理面板后再找
             logger.info("ℹ️ 主界面未直接暴露重启按钮，正在尝试进入 VPS 详情面板...")
             gerer_btn = page.locator('a:has-text("Gérer le VPS"), button:has-text("Gérer le VPS"), a:has-text("Gérer"), a:has-text("Gerer"), [href*="/vps"], [href*="/services"]')
             if gerer_btn.count() > 0 and gerer_btn.first.is_visible():
                 logger.info("👉 点击 'Gérer le VPS' 进入详情面板...")
-                gerer_btn.first.click()
+                gerer_btn.first.click(force=True)
                 try:
                     page.wait_for_load_state("domcontentloaded", timeout=20000)
                 except Exception:
                     pass
                 time.sleep(3)
-                clean_overlays_and_alerts(page)
+                dismiss_gdpr_and_overlays(page)
                 result_info["panel_url"] = page.url
                 logger.info(f"📌 已进入详情页: {page.url}")
 
-                # 在详情页中再次寻找 ACTIONS 里的 Redémarrer
-                reboot_locators_inner = page.locator('button, a').filter(has_text=re.compile(r'Red[eé]marrer', re.I))
-                if reboot_locators_inner.count() > 0:
-                    logger.info("🎯 在 VPS 详情页中找到 'Redémarrer' 按钮，点击重启...")
-                    reboot_locators_inner.first.click()
+                try:
+                    page.evaluate("""() => {
+                        const btn = document.querySelector('[data-vps-power="reboot"]') || 
+                                    Array.from(document.querySelectorAll('button, a')).find(el => (el.innerText || '').toLowerCase().includes('redémarrer') || (el.innerText || '').toLowerCase().includes('redemarrer'));
+                        if (btn) btn.click();
+                    }""")
                     reboot_clicked = True
+                    logger.info("🎯 在 VPS 详情页中原生派发 'Redémarrer' 重启点击")
+                except Exception:
+                    pass
 
         if not reboot_clicked:
             logger.error("❌ 未能在页面上找到任何可点击的 'Redémarrer' 按钮")
@@ -777,7 +815,7 @@ def process_single_account(browser, account, index, total, proxy_server=None):
             result_info["screenshot"] = no_btn_shot
             return result_info
 
-        time.sleep(1.5)
+        time.sleep(2)
 
         # 检查是否存在二次确认弹窗 (Confirmer / Valider / Oui / Yes)
         logger.info("👀 检查是否存在重启二次确认弹窗...")
@@ -787,14 +825,14 @@ def process_single_account(browser, account, index, total, proxy_server=None):
         if confirm_btn.count() > 0 and confirm_btn.first.is_visible():
             logger.info("⚠️ 检测到确认弹窗，点击确认重启...")
             try:
-                confirm_btn.first.click(timeout=3000)
+                confirm_btn.first.click(force=True, timeout=3000)
             except Exception:
                 pass
             time.sleep(2)
 
         # 等待重启指令下发与页面状态响应
         time.sleep(5)
-        clean_overlays_and_alerts(page)
+        dismiss_gdpr_and_overlays(page)
 
         # 截取重启成功操作凭证截图
         success_shot = f"reboot_success_{username}.png"
@@ -877,23 +915,25 @@ def main():
     logger.info(f"📊 任务执行完毕: 成功 {len(success_list)} 个, 失败 {len(fail_list)} 个")
     logger.info("=" * 60)
 
-    # 发送 Telegram 结果报告
+    # 发送 Telegram 结果报告 (全面做 html.escape 防御，避免 HTML 实体错误)
     now_str = (datetime.datetime.utcnow() + datetime.timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
 
     # 1. 逐个推送带图报告
     for r in results:
         if r.get("screenshot") and os.path.exists(r["screenshot"]):
-            badge = "✅ 重启成功 (已保活)" if r["status"] == "SUCCESS" else f"❌ 失败: {r['message']}"
+            safe_user = html.escape(str(r['username']))
+            safe_msg = html.escape(str(r['message']))
+            badge = "✅ 重启成功 (已保活)" if r["status"] == "SUCCESS" else f"❌ 失败: {safe_msg}"
             caption = (
                 f"🚀 <b>NeoHeberg VPS 自动保活报告</b>\n"
                 f"━━━━━━━━━━━━━━━━━━\n"
-                f"👤 <b>账号</b>: <code>{r['username']}</code>\n"
+                f"👤 <b>账号</b>: <code>{safe_user}</code>\n"
                 f"📊 <b>状态</b>: {badge}\n"
                 f"⏱ <b>耗时</b>: {r['duration']} 秒\n"
                 f"⏰ <b>时间</b>: {now_str} (北京时间)\n"
             )
             if r.get("panel_url"):
-                caption += f"🔗 <b>面板</b>: <code>{r['panel_url']}</code>\n"
+                caption += f"🔗 <b>面板</b>: <code>{html.escape(str(r['panel_url']))}</code>\n"
             send_tg_photo(r["screenshot"], caption)
             time.sleep(1)
 
@@ -904,8 +944,10 @@ def main():
         "━━━━━━━━━━━━━━━━━━"
     ]
     for r in results:
-        tag = "✅ 重启成功" if r["status"] == "SUCCESS" else f"❌ {r['message']}"
-        summary_lines.append(f"• 👤 <code>{r['username']}</code>: {tag} ({r['duration']}s)")
+        safe_user = html.escape(str(r['username']))
+        safe_msg = html.escape(str(r['message']))
+        tag = "✅ 重启成功" if r["status"] == "SUCCESS" else f"❌ {safe_msg}"
+        summary_lines.append(f"• 👤 <code>{safe_user}</code>: {tag} ({r['duration']}s)")
     summary_lines.append("──────────────────")
     summary_lines.append(f"📈 <b>总计</b>: 成功 {len(success_list)} / 失败 {len(fail_list)}")
     summary_lines.append(f"⏰ <b>完成时间</b>: {now_str}")
