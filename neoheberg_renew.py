@@ -132,47 +132,72 @@ def clean_overlays_and_alerts(page):
         pass
 
 def try_click_cloudflare(page):
-    """尝试点击页面中出现的 Cloudflare Turnstile 复选框"""
-    clicked = False
+    """检测并尝试穿透 Cloudflare Turnstile 复选框"""
+    title = (page.title() or "").lower()
+    content = (page.content() or "").lower()
 
-    # 1. 在所有 frame 寻找复选框
+    is_cf = (
+        "cloudflare" in title
+        or "just a moment" in title
+        or "vérification" in title
+        or "challenges.cloudflare.com" in content
+        or "cf-turnstile" in content
+        or "turnstile" in content
+    )
+
+    if not is_cf:
+        return False
+
+    logger.info(f"🛡️ 检测到 Cloudflare 验证盾 (页面标题: '{page.title()}')，正在尝试穿透...")
+
+    # 1. 在所有 frame 寻找复选框元素并点击
     for frame in page.frames:
         try:
             chk = frame.locator("input[type='checkbox'], span.mark, .ctp-checkbox-label, #challenge-stage")
             if chk.count() > 0 and chk.first.is_visible():
-                logger.info("👆 检测到 Frame 内的 Turnstile 复选框，正在点击...")
+                logger.info(f"👆 点击 Frame ({frame.url[:40]}...) 内的 Turnstile 复选框")
                 chk.first.click(timeout=1500)
-                clicked = True
                 time.sleep(2)
                 return True
         except Exception:
             pass
 
-    # 2. 页面顶级 iframe 定位并模拟鼠标点击
+    # 2. 定位 iframe 并在其实际屏幕坐标处模拟真实鼠标点击
     try:
         iframes = page.locator("iframe")
-        for i in range(iframes.count()):
+        count = iframes.count()
+        for i in range(count):
             ifr = iframes.nth(i)
             box = ifr.bounding_box()
             if box and box["width"] > 90 and box["height"] > 25:
-                # 复选框位于 iframe 左部 (x + 30, y + height/2)
-                click_x = box["x"] + 30
+                # 复选框位于 iframe 左边缘向右 28px，上下居中
+                click_x = box["x"] + 28
                 click_y = box["y"] + (box["height"] / 2)
-                logger.info(f"👆 模拟真实鼠标点击 Cloudflare 验证框: ({click_x:.1f}, {click_y:.1f})")
+                logger.info(f"👆 模拟鼠标点击 Cloudflare iframe #{i} 坐标: ({click_x:.1f}, {click_y:.1f})")
                 page.mouse.move(click_x, click_y)
-                time.sleep(0.2)
+                time.sleep(0.15)
                 page.mouse.down()
                 time.sleep(0.1)
                 page.mouse.up()
-                clicked = True
-                time.sleep(2)
+                time.sleep(2.5)
                 return True
+    except Exception as e:
+        logger.warning(f"iframe 点击异常: {e}")
+
+    # 3. 兜底尝试点击主页面的 challenge 容器
+    try:
+        stage = page.locator("#challenge-stage, .ctp-checkbox-label, #cf-stage")
+        if stage.count() > 0 and stage.first.is_visible():
+            stage.first.click(timeout=1000)
+            logger.info("👆 点击了 #challenge-stage 容器")
+            time.sleep(2)
+            return True
     except Exception:
         pass
 
-    return clicked
+    return False
 
-def wait_for_login_form_or_cf(page, max_wait_sec=45):
+def wait_for_login_form_or_cf(page, max_wait_sec=40):
     """
     等待登录表单就绪，如果遇到 Cloudflare 盾或 Turnstile 验证，则自动穿透
     """
@@ -193,12 +218,12 @@ def wait_for_login_form_or_cf(page, max_wait_sec=45):
 
         # 2. 检查并点击 Cloudflare 验证框
         try_click_cloudflare(page)
-        time.sleep(1)
+        time.sleep(1.5)
 
-    logger.warning("⚠️ 等待登录表单或穿透 Cloudflare 超时")
+    logger.warning("⚠️ 等待登录表单超时")
     return False
 
-def wait_for_dashboard_or_cf(page, max_wait_sec=45):
+def wait_for_dashboard_or_cf(page, max_wait_sec=40):
     """
     表单提交后，等待进入控制台；若遇 Cloudflare 质询则自动点击穿透
     """
@@ -219,7 +244,7 @@ def wait_for_dashboard_or_cf(page, max_wait_sec=45):
 
         # 3. 检查是否有 Cloudflare 质询并穿透
         try_click_cloudflare(page)
-        time.sleep(1)
+        time.sleep(1.5)
 
     return False
 
@@ -346,7 +371,12 @@ def process_single_account(browser, account, index, total):
         # 尝试访问登录页并完成登录
         for attempt in range(1, 4):
             logger.info(f"🌐 [第 {attempt}/3 次尝试] 访问 NeoHeberg 登录页面: {login_url}")
-            page.goto(login_url, wait_until="domcontentloaded", timeout=35000)
+            try:
+                # 使用 commit 策略，快速获取初始响应，防止 Cloudflare 盾挂起超时
+                page.goto(login_url, wait_until="commit", timeout=45000)
+            except Exception as e:
+                logger.warning(f"page.goto 提示: {e}")
+
             time.sleep(2)
 
             # 等待表单就绪或穿透 Cloudflare
@@ -429,7 +459,10 @@ def process_single_account(browser, account, index, total):
             if gerer_btn.count() > 0 and gerer_btn.first.is_visible():
                 logger.info("👉 点击 'Gérer le VPS' 进入详情面板...")
                 gerer_btn.first.click()
-                page.wait_for_load_state("domcontentloaded", timeout=20000)
+                try:
+                    page.wait_for_load_state("domcontentloaded", timeout=20000)
+                except Exception:
+                    pass
                 time.sleep(3)
                 clean_overlays_and_alerts(page)
                 result_info["panel_url"] = page.url
