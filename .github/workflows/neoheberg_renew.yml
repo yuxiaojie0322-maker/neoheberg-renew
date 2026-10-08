@@ -1,10 +1,10 @@
 name: NeoHeberg Auto Reboot & Keepalive
 
 on:
-  # 瀹氭椂瑙﹀彂锛氭瘡澶╃殑 UTC 鏃堕棿 03:20 鎵ц涓€娆?(瀵瑰簲鍖椾含鏃堕棿 11:20)
+  # 定时触发：每天的 UTC 时间 03:20 执行一次 (对应北京时间 11:20)
   schedule:
     - cron: '20 3 * * *'
-  # 鏀寔鍦?GitHub Actions 椤甸潰鎵嬪姩鐐瑰嚮杩愯
+  # 支持在 GitHub Actions 页面手动点击运行
   workflow_dispatch:
 
 permissions:
@@ -17,29 +17,30 @@ jobs:
     timeout-minutes: 20
 
     steps:
-      - name: 妫€鍑哄叕寮€浠撳簱浠ｇ爜
+      - name: 检出公开仓库代码
         uses: actions/checkout@v4
 
-      - name: 妫€鍑烘牳蹇冪鏈夎剼鏈粨搴?        uses: actions/checkout@v4
+      - name: 检出核心私有脚本仓库
+        uses: actions/checkout@v4
         with:
           repository: ${{ github.repository_owner }}/my-private-scripts
           path: private-scripts
           token: ${{ secrets.CORE_SCRIPT_TOKEN || secrets.REPO_TOKEN || secrets.GH_PAT_PRIVATE_REPO }}
 
-      - name: 璁剧疆 Python 鐜
+      - name: 设置 Python 环境
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
           cache-dependency-path: private-scripts/neoheberg/requirements.txt
 
-      - name: 瀹夎渚濊禆
+      - name: 安装依赖
         run: |
           python -m pip install --upgrade pip
           pip install -r private-scripts/neoheberg/requirements.txt
           playwright install --with-deps chromium
 
-      - name: 鎵ц鐧诲綍涓?VPS 閲嶅惎淇濇椿浠诲姟
+      - name: 执行登录与 VPS 重启保活任务
         env:
           NEOHEBERG_ACCOUNTS: ${{ secrets.NEOHEBERG_ACCOUNTS }}
           PROXY_NODE: ${{ secrets.PROXY_NODE }}
@@ -51,7 +52,7 @@ jobs:
         run: |
           python -u private-scripts/neoheberg/neoheberg_renew.py
 
-      - name: 涓婁紶鎵ц鎴浘蹇収 (鍙緵鎺掓煡涓庣‘璁?
+      - name: 上传执行截图快照 (可供排查与确认)
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -59,10 +60,11 @@ jobs:
           path: "*.png"
           retention-days: 7
 
-      - name: 娓呯悊鏃х殑宸ヤ綔娴佽繍琛岃褰?(浠呬繚鐣欐渶鏂?鏉?
+      - name: 自动清理历史运行记录 (仅保留最新 1 条)
         if: always()
         uses: Mattraks/delete-workflow-runs@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
           retain_days: 0
           keep_minimum_runs: 1
