@@ -7,10 +7,12 @@
 ## 📌 支持特性
 
 - **适配全新 NeoHeberg 面板**：针对 `https://dash.neoheberg.fr` 全新交互架构与路由设计。
+- **集成 sing-box 代理中间件**：内置多协议代理支持（Hysteria2 / VMess / VLESS / TUIC / Trojan / SOCKS5 / HTTP），彻底绕过 GitHub Actions 机房 IP 触发的 Cloudflare 5 秒盾与 Turnstile 质询。
 - **两步登录自动化**：智能处理 `Identifiant (用户名/邮箱)` 与 `Mot de passe (密码)` 两阶段输入切换。
 - **自动穿透 Axel-L Cap-Widget 人机验证**：自动调用并执行 PoW (Proof-of-Work) 挑战计算，验证通过后自动提交。
-- **多位置智能匹配 Redémarrer 重启**：
-  - 优先在首页「Mes services」卡片中直接定位并点击 `↻ Redémarrer`；
+- **自动处理 Google GDPR Consent 弹窗**：自动识别并授权/移除遮罩层，防止干扰主界面元素交互。
+- **精准触发 Redémarrer 重启**：
+  - 优先在首页「Mes services」卡片中通过 `[data-vps-power="reboot"]` 直接派发原生 DOM 点击；
   - 若在首页未暴露，则自动进入 `Gérer le VPS` 详情面板并在「ACTIONS」中触发重启。
 - **自动确认二次弹窗**：如遇二次确认提示框（`Confirmer` / `Valider` / `Oui`）自动确认。
 - **独立仓库自包含运行**：核心脚本与依赖直接存放于本仓库，无需依赖外部私有仓库，开箱即用。
@@ -27,7 +29,8 @@
 
 | Secret 变量名 | 必填 | 示例 / 说明 |
 | :--- | :--- | :--- |
-| `NEOHEBERG_ACCOUNTS` | 选填 | 多个账号（格式为 `账号:密码,账号2:密码2`）。若未设置则默认使用代码内置账号 |
+| `NEOHEBERG_ACCOUNTS` | 选填 | 多个账号（格式为 `账号:密码,账号2:密码2`）。若未设置则默认使用内置账号 `yxj0322` |
+| `PROXY_NODE` / `NODE_LINK` | 选填 | 自定义代理节点链接（支持 `hysteria2://...`、`vmess://...`、`vless://...` 等）。内置高可用节点备选 |
 | `TG_BOT_TOKEN` | 选填 | 你的 Telegram Bot Token（如 `123456789:ABCdefGhI...`） |
 | `TG_CHAT_ID` | 选填 | 你的 Telegram 用户 ID 或频道/群组 ID（如 `987654321`） |
 
