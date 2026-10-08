@@ -19,7 +19,7 @@
 - **多账号批量轮询**：账号间会话（Context / Cookies）严格隔离，互不干扰。
 - **Telegram 推送**：每次运行结束自动推送美化卡片消息，并附带真实 VPS 仪表盘实时操作截图。
 - **运行快照留存**：每次运行均会保存结果截图（如 `reboot_success_username.png`），并上传至 Actions Artifacts。
-- **全自动无人值守**：配套 GitHub Actions 工作流，每 3 天自动定时运行，免电脑开机。
+- **全自动无人值守**：配套 GitHub Actions 工作流，每天自动定时运行一次，免电脑开机。
 
 ---
 
@@ -41,7 +41,7 @@
 ### 方式 1：GitHub Actions 自动定时运行（最推荐，免开机）
 1. 在仓库顶部的 **Actions** 标签页，点击 `NeoHeberg Auto Reboot & Keepalive`；
 2. 点击 **Run workflow** 即可随时手动测试执行；
-3. **定时执行**：默认配置为每 3 天自动执行一次。执行完成后 Telegram 会立刻收到通知！
+3. **定时执行**：默认配置为每天自动执行一次 (北京时间 11:20)。执行完成后 Telegram 会立刻收到通知！
 
 ---
 
