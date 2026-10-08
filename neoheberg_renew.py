@@ -3,7 +3,8 @@
 """
 NeoHeberg VPS 自动登录与重启保活脚本
 - 登录地址: https://dash.neoheberg.fr/login (适配全新 NeoHeberg 仪表盘)
-- 全自动穿透 Cloudflare 5 秒盾与 Turnstile 人机验证复选框 (集成 CDP 原生鼠标事件)
+- 全自动穿透 Cloudflare 5 秒盾与 Turnstile 人机验证
+- 集成 sing-box 本地代理中间件 (自适应 Hysteria2 / VMess / VLESS / TUIC / Trojan / SOCKS5 / HTTP)
 - 两步登录自动化 (Identifiant -> Mot de passe)
 - 自动穿透 Axel-L Cap-Widget 人机验证 (PoW 自动求解与触发)
 - 自动进入控制台并点击 "Redémarrer" (重启服务器) 保持机器与账号活跃度
@@ -18,6 +19,9 @@ import json
 import logging
 import datetime
 import re
+import base64
+import urllib.parse
+import subprocess
 import requests
 from playwright.sync_api import sync_playwright
 
@@ -36,10 +40,313 @@ TG_BOT_TOKEN = _env_tg_token if _env_tg_token else "8867499536:AAF2vlfTao3wvy0x7
 _env_tg_chat = os.environ.get("TG_CHAT_ID", "").strip()
 TG_CHAT_ID = _env_tg_chat if _env_tg_chat else "7772205808"
 
+# 默认代理节点备选配置（优先使用 Hysteria2，备用 VMess）
+DEFAULT_HY2_NODE = "hysteria2://031e1b07-ac55-476d-a415-4b3c5fc411f5@83.168.94.238:30005?sni=www.bing.com&insecure=1&alpn=h3#PL-HY2-2"
+DEFAULT_VMESS_NODE = "vmess://eyJhZGQiOiJjZG5zLmRvb24uZXUub3JnIiwiYWlkIjowLCJob3N0IjoibWVtYnJhbmUtdHVydGxlLWNkdC1iYWJpZXMudHJ5Y2xvdWRmbGFyZS5jb20iLCJpZCI6Ijk3ZDk1YzE0LTI0OGItNGQwNS1hNDNmLWE5ZDIwMzQ5MzQ4NCIsIm5ldCI6IndzIiwicGF0aCI6Ii92bWVzcy1hcmdvIiwicG9ydCI6NDQzLCJwcyI6IkRFLURhdGFsaXgtMSIsInNjeSI6ImF1dG8iLCJzbmkiOiJtZW1icmFuZS10dXJ0bGUtY2R0LWJhYmllcy50cnljbG91ZGZsYXJlLmNvbSIsInRscyI6InRscyIsInR5cGUiOiJub25lIiwidWZwIjoiZmlyZWZveCJ9"
+
 # 默认账号配置（若环境变量 NEOHEBERG_ACCOUNTS 未指定则使用此默认配置）
 DEFAULT_ACCOUNTS = [
     {"username": "yxj0322", "password": "YxJ223512@"}
 ]
+
+# Anti-Detection Stealth Script (抹除自动化特征)
+STEALTH_JS = """
+Object.defineProperty(navigator, 'webdriver', {
+    get: () => false
+});
+
+if (!window.chrome) {
+    window.chrome = {};
+}
+window.chrome.runtime = window.chrome.runtime || {
+    PlatformOs: { MAC: 'mac', WIN: 'win', ANDROID: 'android', CROS: 'cros', LINUX: 'linux', OPENBSD: 'openbsd' },
+    PlatformArch: { ARM: 'arm', X86_32: 'x86-32', X86_64: 'x86-64' },
+    PlatformNaclArch: { ARM: 'arm', X86_32: 'x86-32', X86_64: 'x86-64' }
+};
+
+Object.defineProperty(navigator, 'plugins', {
+    get: () => [1, 2, 3, 4, 5]
+});
+
+Object.defineProperty(navigator, 'languages', {
+    get: () => ['fr-FR', 'fr', 'en-US', 'en']
+});
+
+const origQuery = window.navigator.permissions ? window.navigator.permissions.query : null;
+if (origQuery) {
+    window.navigator.permissions.query = (parameters) => (
+        parameters.name === 'notifications' ?
+            Promise.resolve({ state: Notification.permission }) :
+            origQuery(parameters)
+    );
+}
+"""
+
+def parse_proxy_node(link):
+    """解析主流代理节点链接为 sing-box outbound 结构"""
+    link = (link or "").strip()
+    if not link:
+        return None
+
+    if link.startswith("http://") or link.startswith("https://") or link.startswith("socks5://"):
+        return {"type": "direct_proxy", "url": link}
+
+    proto = link.split("://")[0].lower()
+
+    if proto in ("hysteria2", "hy2"):
+        raw = link.split("://", 1)[1].split("#")[0]
+        auth, rest = raw.split("@", 1) if "@" in raw else ("", raw)
+        host_port, query_str = rest.split("?", 1) if "?" in rest else (rest, "")
+        server, port_str = host_port.split(":", 1) if ":" in host_port else (host_port, "443")
+        params = urllib.parse.parse_qs(query_str)
+        sni = params.get("sni", [""])[0] or server
+        insecure = params.get("insecure", ["0"])[0] in ["1", "true", "True"]
+        alpn = params.get("alpn", ["h3"])
+        if isinstance(alpn, str):
+            alpn = [alpn]
+
+        outbound = {
+            "type": "hysteria2",
+            "tag": "proxy-out",
+            "server": server,
+            "server_port": int(port_str),
+            "password": auth,
+            "tls": {
+                "enabled": True,
+                "server_name": sni,
+                "insecure": insecure,
+                "alpn": alpn
+            }
+        }
+        if params.get("obfs"):
+            outbound["obfs"] = {
+                "type": params.get("obfs", [""])[0],
+                "password": params.get("obfs-password", [""])[0]
+            }
+        return outbound
+
+    if proto == "vmess":
+        raw_b64 = link[8:].split("#")[0]
+        mod = len(raw_b64) % 4
+        if mod == 2:
+            raw_b64 += "=="
+        elif mod == 3:
+            raw_b64 += "="
+        data = json.loads(base64.b64decode(raw_b64).decode("utf-8", "ignore"))
+        outbound = {
+            "type": "vmess",
+            "tag": "proxy-out",
+            "server": data.get("add", ""),
+            "server_port": int(data.get("port", 443)),
+            "uuid": data.get("id", ""),
+            "security": data.get("scy", "auto"),
+            "alter_id": int(data.get("aid", 0)),
+        }
+        if data.get("tls") == "tls":
+            tls_cfg = {
+                "enabled": True,
+                "server_name": data.get("sni") or data.get("host") or data.get("add", ""),
+                "insecure": False,
+            }
+            if data.get("ufp"):
+                tls_cfg["utls"] = {"enabled": True, "fingerprint": data["ufp"]}
+            outbound["tls"] = tls_cfg
+        if data.get("net") == "ws":
+            outbound["transport"] = {
+                "type": "ws",
+                "path": urllib.parse.unquote(data.get("path", "/")),
+                "headers": {
+                    "Host": data.get("host") or data.get("sni") or data.get("add", "")
+                }
+            }
+        return outbound
+
+    if proto == "vless":
+        raw = link[8:]
+        user_host = raw.split("#")[0]
+        uuid, rest = user_host.split("@", 1) if "@" in user_host else ("", user_host)
+        host_port, query_str = rest.split("?", 1) if "?" in rest else (rest, "")
+        server, port_str = host_port.split(":", 1) if ":" in host_port else (host_port, "443")
+        params = urllib.parse.parse_qs(query_str)
+        get_p = lambda k, d="": params.get(k, [d])[0]
+
+        outbound = {
+            "type": "vless",
+            "tag": "proxy-out",
+            "server": server,
+            "server_port": int(port_str),
+            "uuid": uuid,
+        }
+        if get_p("flow"):
+            outbound["flow"] = get_p("flow")
+        sec = get_p("security")
+        if sec == "tls":
+            outbound["tls"] = {
+                "enabled": True,
+                "server_name": get_p("sni") or get_p("host") or server,
+                "insecure": get_p("insecure") == "1" or get_p("allowInsecure") == "1",
+            }
+        elif sec == "reality":
+            outbound["tls"] = {
+                "enabled": True,
+                "server_name": get_p("sni") or server,
+                "reality": {
+                    "enabled": True,
+                    "public_key": get_p("pbk"),
+                    "short_id": get_p("sid"),
+                },
+                "utls": {"enabled": True, "fingerprint": get_p("fp", "chrome")},
+            }
+        if get_p("type") == "ws":
+            outbound["transport"] = {
+                "type": "ws",
+                "path": urllib.parse.unquote(get_p("path", "/")),
+                "headers": {
+                    "Host": get_p("host") or get_p("sni") or server
+                }
+            }
+        return outbound
+
+    if proto == "tuic":
+        raw = link[7:].split("#")[0]
+        auth, rest = raw.split("@", 1) if "@" in raw else ("", raw)
+        uuid, password = auth.split(":", 1) if ":" in auth else (auth, auth)
+        host_port, query_str = rest.split("?", 1) if "?" in rest else (rest, "")
+        server, port_str = host_port.split(":", 1) if ":" in host_port else (host_port, "443")
+        params = urllib.parse.parse_qs(query_str)
+        get_p = lambda k, d="": params.get(k, [d])[0]
+        return {
+            "type": "tuic",
+            "tag": "proxy-out",
+            "server": server,
+            "server_port": int(port_str),
+            "uuid": uuid,
+            "password": password,
+            "congestion_control": get_p("congestion_control", "bbr"),
+            "udp_relay_mode": get_p("udp_relay_mode", "native"),
+            "tls": {
+                "enabled": True,
+                "server_name": get_p("sni") or server,
+                "alpn": [get_p("alpn", "h3")],
+                "insecure": get_p("allow_insecure") == "1" or get_p("insecure") == "1",
+            }
+        }
+
+    if proto == "trojan":
+        raw = link[9:].split("#")[0]
+        password, rest = raw.split("@", 1) if "@" in raw else ("", raw)
+        host_port, query_str = rest.split("?", 1) if "?" in rest else (rest, "")
+        server, port_str = host_port.split(":", 1) if ":" in host_port else (host_port, "443")
+        params = urllib.parse.parse_qs(query_str)
+        get_p = lambda k, d="": params.get(k, [d])[0]
+        outbound = {
+            "type": "trojan",
+            "tag": "proxy-out",
+            "server": server,
+            "server_port": int(port_str),
+            "password": password,
+            "tls": {
+                "enabled": True,
+                "server_name": get_p("sni") or server,
+                "insecure": get_p("allowInsecure") == "1" or get_p("insecure") == "1",
+            }
+        }
+        if get_p("type") == "ws":
+            outbound["transport"] = {
+                "type": "ws",
+                "path": urllib.parse.unquote(get_p("path", "/")),
+                "headers": {"Host": get_p("host") or get_p("sni") or server}
+            }
+        return outbound
+
+    return None
+
+def start_proxy(listen_port=10808):
+    """
+    启动本地 sing-box 代理进程，将代理节点转换为本地 SOCKS5/HTTP 混合端口
+    返回本地代理 URL（如 'http://127.0.0.1:10808'）供 Playwright 使用
+    """
+    # 候选节点列表
+    node_candidates = []
+    env_node = (os.environ.get("PROXY_NODE") or os.environ.get("NODE_LINK") or os.environ.get("PROXY_URL") or "").strip()
+    if env_node:
+        node_candidates.append(env_node)
+    node_candidates.append(DEFAULT_HY2_NODE)
+    node_candidates.append(DEFAULT_VMESS_NODE)
+
+    # 检查平台二进制
+    singbox_bin = "./sing-box"
+    if sys.platform.startswith("linux"):
+        if not os.path.exists(singbox_bin):
+            logger.info("📦 正在下载 sing-box 代理中间件...")
+            try:
+                url = "https://github.com/SagerNet/sing-box/releases/download/v1.9.3/sing-box-1.9.3-linux-amd64.tar.gz"
+                subprocess.run(["curl", "-sLo", "sing-box.tar.gz", url], check=True)
+                subprocess.run(["tar", "-xzf", "sing-box.tar.gz", "--strip-components=1"], check=True)
+                subprocess.run(["chmod", "+x", singbox_bin], check=True)
+                logger.info("✅ sing-box 二进制就绪！")
+            except Exception as e:
+                logger.error(f"❌ 下载 sing-box 失败: {e}，将尝试直连")
+                return None
+    else:
+        singbox_bin = "sing-box.exe"
+        if not os.path.exists(singbox_bin):
+            logger.info("ℹ️ 非 Linux 环境未找到 sing-box.exe，使用系统直连/默认网络")
+            return None
+
+    for idx, candidate in enumerate(node_candidates, 1):
+        try:
+            parsed = parse_proxy_node(candidate)
+            if not parsed:
+                continue
+
+            if parsed.get("type") == "direct_proxy":
+                logger.info(f"🌐 使用直接代理地址: {parsed['url']}")
+                return parsed["url"]
+
+            logger.info(f"🚀 尝试启动代理节点 [{idx}/{len(node_candidates)}]: {parsed['type']} -> 目标 {parsed.get('server')}:{parsed.get('server_port')}")
+
+            config = {
+                "log": {"level": "warn"},
+                "inbounds": [
+                    {
+                        "type": "mixed",
+                        "tag": "mixed-in",
+                        "listen": "127.0.0.1",
+                        "listen_port": listen_port
+                    }
+                ],
+                "outbounds": [parsed]
+            }
+
+            config_file = "singbox_proxy_config.json"
+            with open(config_file, "w", encoding="utf-8") as f:
+                json.dump(config, f, indent=2)
+
+            proc = subprocess.Popen([singbox_bin, "run", "-c", config_file], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            time.sleep(3)
+
+            # 测试代理连通性并获取出口 IP
+            local_proxy = f"http://127.0.0.1:{listen_port}"
+            try:
+                res = requests.get(
+                    "https://api.ipify.org?format=json",
+                    proxies={"http": local_proxy, "https": local_proxy},
+                    timeout=10
+                )
+                out_ip = res.json().get("ip")
+                logger.info(f"✨ 代理连通成功！节点出口 IP: {out_ip}")
+                return local_proxy
+            except Exception as e:
+                logger.warning(f"⚠️ 节点 [{idx}] 连通测试失败 ({e})，尝试终止并切换下一候选节点...")
+                proc.terminate()
+                time.sleep(1)
+
+        except Exception as e:
+            logger.warning(f"解析或启动节点异常: {e}")
+
+    logger.warning("⚠️ 所有代理节点均不可用，降级为直连访问")
+    return None
 
 def load_accounts():
     """从环境变量解析账号列表，支持 JSON 或 'user:pass,user2:pass2' 格式"""
@@ -211,7 +518,6 @@ def try_click_cloudflare(page, cdp_session):
         pass
 
     # 3. 若 DOM 中尚未暴露 iframe，直接通过已知的标准视口坐标触发 CDP 硬件级点击
-    # 在 1440x900 视口下，Turnstile 复选框绝对坐标位于 x=294, y=372
     if not found_geom:
         logger.info("👆 触发 CDP 视口基准坐标硬件点击: (294, 372)...")
         cdp_native_click(cdp_session, 294, 372)
@@ -223,25 +529,19 @@ def try_click_cloudflare(page, cdp_session):
     return False
 
 def wait_for_login_form_or_cf(page, cdp_session, max_wait_sec=40):
-    """
-    等待登录表单就绪，如果遇到 Cloudflare 盾或 Turnstile 验证，则自动穿透
-    """
+    """等待登录表单就绪，如果遇到 Cloudflare 盾或 Turnstile 验证，则自动穿透"""
     logger.info("⏳ 等待登录页面加载（含 Cloudflare 质询检测与穿透）...")
     start_t = time.time()
-    
     while time.time() - start_t < max_wait_sec:
-        # 1. 检查真实表单是否已呈现
         id_loc = page.locator('input#identifier, input[name="identifier"]')
         if id_loc.count() > 0 and id_loc.first.is_visible():
             logger.info("✅ 登录表单已就绪！")
             return True
 
-        # 检查是否已在后台
         if page.locator(':text("Mes services"), :text("Tableau de bord"), a:has-text("Déconnexion")').count() > 0:
             logger.info("🎉 检测到后台组件，已处于登录态！")
             return True
 
-        # 2. 检查并点击 Cloudflare 验证框
         try_click_cloudflare(page, cdp_session)
         time.sleep(1.5)
 
@@ -249,25 +549,20 @@ def wait_for_login_form_or_cf(page, cdp_session, max_wait_sec=40):
     return False
 
 def wait_for_dashboard_or_cf(page, cdp_session, max_wait_sec=40):
-    """
-    表单提交后，等待进入控制台；若遇 Cloudflare 质询则自动点击穿透
-    """
+    """表单提交后，等待进入控制台；若遇 Cloudflare 质询则自动点击穿透"""
     logger.info("⏳ 监控登录跳转（含 Cloudflare 质询检测与穿透）...")
     start_t = time.time()
     while time.time() - start_t < max_wait_sec:
-        # 1. 检查是否进入控制台
         if page.locator(':text("Mes services"), :text("Tableau de bord"), a:has-text("Déconnexion"), [data-action="logout"]').count() > 0:
             logger.info("🎉 成功进入控制台后台！")
             return True
 
-        # 2. 检查是否有错误提示
         err_loc = page.locator('#identifierError, #loginCaptchaError, .text-red-400')
         if err_loc.count() > 0 and err_loc.first.is_visible():
             err_text = err_loc.first.text_content().strip()
             if err_text:
                 logger.warning(f"⚠️ 页面提示错误: {err_text}")
 
-        # 3. 检查是否有 Cloudflare 质询并穿透
         try_click_cloudflare(page, cdp_session)
         time.sleep(1.5)
 
@@ -280,7 +575,6 @@ def solve_dash_cap_widget(page):
     """
     logger.info("🔍 检查 Cap-Widget 人机验证状态...")
     try:
-        # 1. 尝试直接调用 Web Component 的 solve() 方法
         page.evaluate("""async () => {
             const widget = document.getElementById('cap-login') || document.querySelector('cap-widget');
             if (widget && typeof widget.solve === 'function') {
@@ -291,7 +585,6 @@ def solve_dash_cap_widget(page):
         }""")
         time.sleep(1)
 
-        # 2. 如果存在 trigger 按钮则执行点击
         widget_trigger = page.locator('#cap-login, cap-widget, cap-widget .captcha-trigger, cap-widget [role="button"]')
         if widget_trigger.count() > 0:
             try:
@@ -300,7 +593,6 @@ def solve_dash_cap_widget(page):
             except Exception:
                 pass
 
-        # 3. 轮询等待验证完成（最长等待 30 秒）
         logger.info("⏳ 等待 Cap-Widget 验证完成...")
         for _ in range(30):
             token_ready = page.evaluate("""() => {
@@ -320,40 +612,14 @@ def solve_dash_cap_widget(page):
                 time.sleep(1)
                 return True
             time.sleep(1)
-        
+
         logger.warning("⚠️ Cap-Widget 等待超时，尝试直接提交")
     except Exception as e:
         logger.warning(f"Cap-Widget 处理过程出现提示: {e}")
     return True
 
-def apply_stealth_scripts(context):
-    """注入反检测特征脚本，消除 automation controlled 标志"""
-    context.add_init_script("""
-        Object.defineProperty(navigator, 'webdriver', {
-            get: () => false
-        });
-        Object.defineProperty(navigator, 'languages', {
-            get: () => ['fr-FR', 'fr', 'en-US', 'en']
-        });
-        Object.defineProperty(navigator, 'plugins', {
-            get: () => [1, 2, 3, 4, 5]
-        });
-        window.chrome = {
-            runtime: {},
-            loadTimes: function() {},
-            csi: function() {},
-            app: {}
-        };
-        const originalQuery = window.navigator.permissions.query;
-        window.navigator.permissions.query = (parameters) => (
-            parameters.name === 'notifications' ?
-                Promise.resolve({ state: Notification.permission }) :
-                originalQuery(parameters)
-        );
-    """)
-
-def process_single_account(browser, account, index, total):
-    """处理单个 NeoHeberg 账号的登录与 VPS 重启任务 (带自动重试机制)"""
+def process_single_account(browser, account, index, total, proxy_server=None):
+    """处理单个 NeoHeberg 账号的登录与 VPS 重启任务"""
     username = account.get("username", "").strip()
     password = account.get("password", "").strip()
     start_time = time.time()
@@ -363,18 +629,21 @@ def process_single_account(browser, account, index, total):
     logger.info("=" * 60)
 
     # 独立会话隔离
-    context = browser.new_context(
-        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-        viewport={"width": 1440, "height": 900},
-        locale="fr-FR",
-        timezone_id="Europe/Paris"
-    )
-    apply_stealth_scripts(context)
+    context_kwargs = {
+        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        "viewport": {"width": 1440, "height": 900},
+        "locale": "fr-FR",
+        "timezone_id": "Europe/Paris"
+    }
+    if proxy_server:
+        context_kwargs["proxy"] = {"server": proxy_server}
+
+    context = browser.new_context(**context_kwargs)
+    context.add_init_script(STEALTH_JS)
 
     page = context.new_page()
     cdp_session = context.new_cdp_session(page)
 
-    # 尝试加载 playwright_stealth
     try:
         from playwright_stealth import stealth_sync
         stealth_sync(page)
@@ -566,23 +835,35 @@ def main():
         sys.exit(1)
 
     logger.info(f"🚀 开始执行 NeoHeberg 自动保活重启任务，共加载 {len(accounts)} 个账号")
+
+    # 启动代理中间件（彻底解决 Cloudflare 5 秒盾与机房 IP 拦截）
+    proxy_server = start_proxy(listen_port=10808)
+    if proxy_server:
+        logger.info(f"🛡️ 全局网络已接入代理中间件: {proxy_server}")
+    else:
+        logger.info("🌐 未使用代理中间件，将使用系统直连并启用 Turnstile 本地穿透模式")
+
     headless = os.environ.get("HEADLESS", "true").lower() != "false"
 
     results = []
     with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=headless,
-            args=[
+        launch_kwargs = {
+            "headless": headless,
+            "args": [
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
                 "--disable-blink-features=AutomationControlled",
                 "--disable-infobars",
                 "--window-size=1440,900"
             ]
-        )
+        }
+        if proxy_server:
+            launch_kwargs["proxy"] = {"server": proxy_server}
+
+        browser = p.chromium.launch(**launch_kwargs)
 
         for i, acc in enumerate(accounts, 1):
-            res = process_single_account(browser, acc, i, len(accounts))
+            res = process_single_account(browser, acc, i, len(accounts), proxy_server=proxy_server)
             results.append(res)
             if i < len(accounts):
                 time.sleep(5)
