@@ -3,7 +3,7 @@
 """
 NeoHeberg VPS 自动登录与重启保活脚本
 - 登录地址: https://dash.neoheberg.fr/login (适配全新 NeoHeberg 仪表盘)
-- 集成 Stealth 反爬指纹绕过与 Cloudflare Turnstile 5 秒盾自动穿透
+- 全自动穿透 Cloudflare 5 秒盾与 Turnstile 人机验证复选框
 - 两步登录自动化 (Identifiant -> Mot de passe)
 - 自动穿透 Axel-L Cap-Widget 人机验证 (PoW 自动求解与触发)
 - 自动进入控制台并点击 "Redémarrer" (重启服务器) 保持机器与账号活跃度
@@ -19,7 +19,7 @@ import logging
 import datetime
 import re
 import requests
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
+from playwright.sync_api import sync_playwright
 
 # 配置日志输出格式
 logging.basicConfig(
@@ -131,53 +131,94 @@ def clean_overlays_and_alerts(page):
     except Exception:
         pass
 
-def try_pass_cloudflare_turnstile(page, max_wait_sec=25):
-    """检测并尝试穿透 Cloudflare 5 秒盾与 Turnstile 验证组件"""
-    for _ in range(max_wait_sec):
-        title = (page.title() or "").lower()
-        content = (page.content() or "").lower()
+def try_click_cloudflare(page):
+    """尝试点击页面中出现的 Cloudflare Turnstile 复选框"""
+    clicked = False
 
-        # 检查是否处于 Cloudflare 质询状态
-        is_cf = (
-            "cloudflare" in title
-            or "just a moment" in title
-            or "vérification de sécurité" in title
-            or "challenges.cloudflare.com" in content
-            or "cf-turnstile" in content
-        )
+    # 1. 在所有 frame 寻找复选框
+    for frame in page.frames:
+        try:
+            chk = frame.locator("input[type='checkbox'], span.mark, .ctp-checkbox-label, #challenge-stage")
+            if chk.count() > 0 and chk.first.is_visible():
+                logger.info("👆 检测到 Frame 内的 Turnstile 复选框，正在点击...")
+                chk.first.click(timeout=1500)
+                clicked = True
+                time.sleep(2)
+                return True
+        except Exception:
+            pass
 
-        if not is_cf:
-            # 已经脱离 Cloudflare 盾页面
+    # 2. 页面顶级 iframe 定位并模拟鼠标点击
+    try:
+        iframes = page.locator("iframe")
+        for i in range(iframes.count()):
+            ifr = iframes.nth(i)
+            box = ifr.bounding_box()
+            if box and box["width"] > 90 and box["height"] > 25:
+                # 复选框位于 iframe 左部 (x + 30, y + height/2)
+                click_x = box["x"] + 30
+                click_y = box["y"] + (box["height"] / 2)
+                logger.info(f"👆 模拟真实鼠标点击 Cloudflare 验证框: ({click_x:.1f}, {click_y:.1f})")
+                page.mouse.move(click_x, click_y)
+                time.sleep(0.2)
+                page.mouse.down()
+                time.sleep(0.1)
+                page.mouse.up()
+                clicked = True
+                time.sleep(2)
+                return True
+    except Exception:
+        pass
+
+    return clicked
+
+def wait_for_login_form_or_cf(page, max_wait_sec=45):
+    """
+    等待登录表单就绪，如果遇到 Cloudflare 盾或 Turnstile 验证，则自动穿透
+    """
+    logger.info("⏳ 等待登录页面加载（含 Cloudflare 质询检测与穿透）...")
+    start_t = time.time()
+    
+    while time.time() - start_t < max_wait_sec:
+        # 1. 检查真实表单是否已呈现
+        id_loc = page.locator('input#identifier, input[name="identifier"]')
+        if id_loc.count() > 0 and id_loc.first.is_visible():
+            logger.info("✅ 登录表单已就绪！")
             return True
 
-        logger.info("🛡️ 正在尝试穿透 Cloudflare Turnstile 验证框...")
+        # 检查是否已在后台
+        if page.locator(':text("Mes services"), :text("Tableau de bord"), a:has-text("Déconnexion")').count() > 0:
+            logger.info("🎉 检测到后台组件，已处于登录态！")
+            return True
 
-        # 1. 尝试在所有 Frame 中寻找 checkbox
-        for frame in page.frames:
-            try:
-                chk = frame.locator("input[type='checkbox'], span.mark, .ctp-checkbox-label, #challenge-stage")
-                if chk.count() > 0 and chk.first.is_visible():
-                    chk.first.click(timeout=1500)
-                    logger.info("👆 已点击 Frame 内的 Turnstile 复选框")
-                    time.sleep(2)
-                    break
-            except Exception:
-                pass
+        # 2. 检查并点击 Cloudflare 验证框
+        try_click_cloudflare(page)
+        time.sleep(1)
 
-        # 2. 模拟鼠标点击 Turnstile iframe 的复选框中心偏左区域
-        for sel in ["iframe[src*='challenges.cloudflare.com']", "iframe[src*='turnstile']", "iframe[title*='Cloudflare']"]:
-            try:
-                cf_frame = page.locator(sel)
-                if cf_frame.count() > 0 and cf_frame.first.is_visible():
-                    box = cf_frame.first.bounding_box()
-                    if box:
-                        page.mouse.click(box["x"] + 28, box["y"] + box["height"] / 2)
-                        logger.info("👆 模拟鼠标点击 Turnstile 区域")
-                        time.sleep(2)
-                        break
-            except Exception:
-                pass
+    logger.warning("⚠️ 等待登录表单或穿透 Cloudflare 超时")
+    return False
 
+def wait_for_dashboard_or_cf(page, max_wait_sec=45):
+    """
+    表单提交后，等待进入控制台；若遇 Cloudflare 质询则自动点击穿透
+    """
+    logger.info("⏳ 监控登录跳转（含 Cloudflare 质询检测与穿透）...")
+    start_t = time.time()
+    while time.time() - start_t < max_wait_sec:
+        # 1. 检查是否进入控制台
+        if page.locator(':text("Mes services"), :text("Tableau de bord"), a:has-text("Déconnexion"), [data-action="logout"]').count() > 0:
+            logger.info("🎉 成功进入控制台后台！")
+            return True
+
+        # 2. 检查是否有错误提示
+        err_loc = page.locator('#identifierError, #loginCaptchaError, .text-red-400')
+        if err_loc.count() > 0 and err_loc.first.is_visible():
+            err_text = err_loc.first.text_content().strip()
+            if err_text:
+                logger.warning(f"⚠️ 页面提示错误: {err_text}")
+
+        # 3. 检查是否有 Cloudflare 质询并穿透
+        try_click_cloudflare(page)
         time.sleep(1)
 
     return False
@@ -238,25 +279,21 @@ def solve_dash_cap_widget(page):
 def apply_stealth_scripts(context):
     """注入反检测特征脚本，消除 automation controlled 标志"""
     context.add_init_script("""
-        // 伪装 navigator.webdriver
         Object.defineProperty(navigator, 'webdriver', {
             get: () => false
         });
-        // 伪装语言与插件
         Object.defineProperty(navigator, 'languages', {
             get: () => ['fr-FR', 'fr', 'en-US', 'en']
         });
         Object.defineProperty(navigator, 'plugins', {
             get: () => [1, 2, 3, 4, 5]
         });
-        // 伪装 chrome 对象
         window.chrome = {
             runtime: {},
             loadTimes: function() {},
             csi: function() {},
             app: {}
         };
-        // 伪装 permissions
         const originalQuery = window.navigator.permissions.query;
         window.navigator.permissions.query = (parameters) => (
             parameters.name === 'notifications' ?
@@ -279,7 +316,8 @@ def process_single_account(browser, account, index, total):
     context = browser.new_context(
         user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
         viewport={"width": 1440, "height": 900},
-        locale="fr-FR"
+        locale="fr-FR",
+        timezone_id="Europe/Paris"
     )
     apply_stealth_scripts(context)
 
@@ -305,26 +343,25 @@ def process_single_account(browser, account, index, total):
         login_url = "https://dash.neoheberg.fr/login"
         logged_in = False
 
-        # 登录重试循环（支持 Cloudflare 质询穿透与 Cookie 保持重试）
+        # 尝试访问登录页并完成登录
         for attempt in range(1, 4):
             logger.info(f"🌐 [第 {attempt}/3 次尝试] 访问 NeoHeberg 登录页面: {login_url}")
             page.goto(login_url, wait_until="domcontentloaded", timeout=35000)
             time.sleep(2)
 
-            # 检查是否有前置 Cloudflare 盾
-            try_pass_cloudflare_turnstile(page, max_wait_sec=15)
+            # 等待表单就绪或穿透 Cloudflare
+            form_ready = wait_for_login_form_or_cf(page, max_wait_sec=40)
 
-            # 检查是否已直接处于已登录页面
+            # 检查是否已直接处于登录态
             if page.locator(':text("Mes services"), :text("Tableau de bord"), a:has-text("Déconnexion")').count() > 0:
                 logger.info("🎉 识别到后台核心组件，当前已处于登录态！")
                 logged_in = True
                 break
 
-            if "/login" in page.url or page.locator('#identifier, input[name="identifier"]').count() > 0:
+            if form_ready and page.locator('#identifier, input[name="identifier"]').count() > 0:
                 # 步骤 1: 填写用户名/邮箱并点击 Continuer (两步式登录)
                 logger.info(f"✍️ [第 1 步] 填写 Identifiant: {username}")
                 id_input = page.locator('input#identifier, input[name="identifier"]')
-                id_input.wait_for(state="visible", timeout=15000)
                 id_input.fill(username)
                 time.sleep(0.5)
 
@@ -353,28 +390,9 @@ def process_single_account(browser, account, index, total):
                 submit_btn = page.locator('form.login-form button[type="submit"], button:has-text("Se connecter")')
                 submit_btn.first.click()
 
-                # 提交后可能触发 Cloudflare Turnstile 质询盾，给予检测与穿透
-                logger.info("⏳ 表单已提交，监测登录跳转与 Cloudflare 质询状态...")
-                for w in range(35):
-                    time.sleep(1)
-
-                    # 1. 检测是否已成功登录（出现 Mes services、Tableau de bord、Déconnexion）
-                    if page.locator(':text("Mes services"), :text("Tableau de bord"), a:has-text("Déconnexion"), [data-action="logout"]').count() > 0:
-                        logger.info(f"🎉 登录成功！当前控制台页面: {page.url}")
-                        logged_in = True
-                        break
-
-                    # 2. 检测并穿透 Cloudflare Turnstile
-                    try_pass_cloudflare_turnstile(page, max_wait_sec=3)
-
-                    # 3. 检测是否有明显的错误提示
-                    err_loc = page.locator('#identifierError, #loginCaptchaError, .text-red-400')
-                    if err_loc.count() > 0 and err_loc.first.is_visible():
-                        err_text = err_loc.first.text_content().strip()
-                        if err_text:
-                            logger.warning(f"⚠️ 登录提示: {err_text}")
-
-                if logged_in:
+                # 监测跳转或穿透提交后的 Cloudflare
+                if wait_for_dashboard_or_cf(page, max_wait_sec=40):
+                    logged_in = True
                     break
 
             time.sleep(2)
