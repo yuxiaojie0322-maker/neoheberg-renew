@@ -1,9 +1,9 @@
 name: NeoHeberg Auto Reboot & Keepalive
 
 on:
-  # 定时触发：每 3 天的 UTC 时间 03:20 执行一次 (对应北京时间 11:20)
+  # 定时触发：每天的 UTC 时间 03:20 执行一次 (对应北京时间 11:20)
   schedule:
-    - cron: '20 3 */3 * *'
+    - cron: '20 3 * * *'
   # 支持在 GitHub Actions 页面手动点击运行
   workflow_dispatch:
 
