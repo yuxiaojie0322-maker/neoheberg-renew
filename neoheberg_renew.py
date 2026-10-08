@@ -3,7 +3,7 @@
 """
 NeoHeberg VPS 自动登录与重启保活脚本
 - 登录地址: https://dash.neoheberg.fr/login (适配全新 NeoHeberg 仪表盘)
-- 全自动穿透 Cloudflare 5 秒盾与 Turnstile 人机验证复选框
+- 全自动穿透 Cloudflare 5 秒盾与 Turnstile 人机验证复选框 (集成 CDP 原生鼠标事件)
 - 两步登录自动化 (Identifiant -> Mot de passe)
 - 自动穿透 Axel-L Cap-Widget 人机验证 (PoW 自动求解与触发)
 - 自动进入控制台并点击 "Redémarrer" (重启服务器) 保持机器与账号活跃度
@@ -131,14 +131,44 @@ def clean_overlays_and_alerts(page):
     except Exception:
         pass
 
-def try_click_cloudflare(page):
-    """检测并尝试穿透 Cloudflare Turnstile 复选框"""
+def cdp_native_click(cdp_session, x, y):
+    """利用 CDP 发送真实的操作系统级硬件鼠标点击事件"""
+    try:
+        cdp_session.send('Input.dispatchMouseEvent', {
+            'type': 'mouseMoved',
+            'x': int(x),
+            'y': int(y)
+        })
+        time.sleep(0.1)
+        cdp_session.send('Input.dispatchMouseEvent', {
+            'type': 'mousePressed',
+            'x': int(x),
+            'y': int(y),
+            'button': 'left',
+            'clickCount': 1
+        })
+        time.sleep(0.12)
+        cdp_session.send('Input.dispatchMouseEvent', {
+            'type': 'mouseReleased',
+            'x': int(x),
+            'y': int(y),
+            'button': 'left',
+            'clickCount': 1
+        })
+        return True
+    except Exception as e:
+        logger.warning(f"CDP 点击失败: {e}")
+        return False
+
+def try_click_cloudflare(page, cdp_session):
+    """检测并尝试通过 CDP 和 DOM 穿透 Cloudflare Turnstile 复选框"""
     title = (page.title() or "").lower()
     content = (page.content() or "").lower()
 
     is_cf = (
         "cloudflare" in title
         or "just a moment" in title
+        or "un instant" in title
         or "vérification" in title
         or "challenges.cloudflare.com" in content
         or "cf-turnstile" in content
@@ -148,9 +178,9 @@ def try_click_cloudflare(page):
     if not is_cf:
         return False
 
-    logger.info(f"🛡️ 检测到 Cloudflare 验证盾 (页面标题: '{page.title()}')，正在尝试穿透...")
+    logger.info(f"🛡️ 检测到 Cloudflare 验证盾 (标题: '{page.title()}')，正在尝试穿透...")
 
-    # 1. 在所有 frame 寻找复选框元素并点击
+    # 1. 尝试直接点击 Frame 内的复选框
     for frame in page.frames:
         try:
             chk = frame.locator("input[type='checkbox'], span.mark, .ctp-checkbox-label, #challenge-stage")
@@ -162,42 +192,37 @@ def try_click_cloudflare(page):
         except Exception:
             pass
 
-    # 2. 定位 iframe 并在其实际屏幕坐标处模拟真实鼠标点击
+    # 2. 获取页面中 Cloudflare 舞台或 iframe 的几何坐标
+    found_geom = False
     try:
         iframes = page.locator("iframe")
-        count = iframes.count()
-        for i in range(count):
+        for i in range(iframes.count()):
             ifr = iframes.nth(i)
             box = ifr.bounding_box()
-            if box and box["width"] > 90 and box["height"] > 25:
-                # 复选框位于 iframe 左边缘向右 28px，上下居中
+            if box and box["width"] > 80 and box["height"] > 25:
                 click_x = box["x"] + 28
                 click_y = box["y"] + (box["height"] / 2)
-                logger.info(f"👆 模拟鼠标点击 Cloudflare iframe #{i} 坐标: ({click_x:.1f}, {click_y:.1f})")
-                page.mouse.move(click_x, click_y)
-                time.sleep(0.15)
-                page.mouse.down()
-                time.sleep(0.1)
-                page.mouse.up()
+                logger.info(f"👆 通过 CDP 点击识别到的 Cloudflare iframe 坐标: ({click_x:.1f}, {click_y:.1f})")
+                cdp_native_click(cdp_session, click_x, click_y)
+                found_geom = True
                 time.sleep(2.5)
                 return True
-    except Exception as e:
-        logger.warning(f"iframe 点击异常: {e}")
-
-    # 3. 兜底尝试点击主页面的 challenge 容器
-    try:
-        stage = page.locator("#challenge-stage, .ctp-checkbox-label, #cf-stage")
-        if stage.count() > 0 and stage.first.is_visible():
-            stage.first.click(timeout=1000)
-            logger.info("👆 点击了 #challenge-stage 容器")
-            time.sleep(2)
-            return True
     except Exception:
         pass
 
+    # 3. 若 DOM 中尚未暴露 iframe，直接通过已知的标准视口坐标触发 CDP 硬件级点击
+    # 在 1440x900 视口下，Turnstile 复选框绝对坐标位于 x=294, y=372
+    if not found_geom:
+        logger.info("👆 触发 CDP 视口基准坐标硬件点击: (294, 372)...")
+        cdp_native_click(cdp_session, 294, 372)
+        time.sleep(0.2)
+        cdp_native_click(cdp_session, 298, 372)
+        time.sleep(2)
+        return True
+
     return False
 
-def wait_for_login_form_or_cf(page, max_wait_sec=40):
+def wait_for_login_form_or_cf(page, cdp_session, max_wait_sec=40):
     """
     等待登录表单就绪，如果遇到 Cloudflare 盾或 Turnstile 验证，则自动穿透
     """
@@ -217,13 +242,13 @@ def wait_for_login_form_or_cf(page, max_wait_sec=40):
             return True
 
         # 2. 检查并点击 Cloudflare 验证框
-        try_click_cloudflare(page)
+        try_click_cloudflare(page, cdp_session)
         time.sleep(1.5)
 
     logger.warning("⚠️ 等待登录表单超时")
     return False
 
-def wait_for_dashboard_or_cf(page, max_wait_sec=40):
+def wait_for_dashboard_or_cf(page, cdp_session, max_wait_sec=40):
     """
     表单提交后，等待进入控制台；若遇 Cloudflare 质询则自动点击穿透
     """
@@ -243,7 +268,7 @@ def wait_for_dashboard_or_cf(page, max_wait_sec=40):
                 logger.warning(f"⚠️ 页面提示错误: {err_text}")
 
         # 3. 检查是否有 Cloudflare 质询并穿透
-        try_click_cloudflare(page)
+        try_click_cloudflare(page, cdp_session)
         time.sleep(1.5)
 
     return False
@@ -347,6 +372,7 @@ def process_single_account(browser, account, index, total):
     apply_stealth_scripts(context)
 
     page = context.new_page()
+    cdp_session = context.new_cdp_session(page)
 
     # 尝试加载 playwright_stealth
     try:
@@ -372,7 +398,6 @@ def process_single_account(browser, account, index, total):
         for attempt in range(1, 4):
             logger.info(f"🌐 [第 {attempt}/3 次尝试] 访问 NeoHeberg 登录页面: {login_url}")
             try:
-                # 使用 commit 策略，快速获取初始响应，防止 Cloudflare 盾挂起超时
                 page.goto(login_url, wait_until="commit", timeout=45000)
             except Exception as e:
                 logger.warning(f"page.goto 提示: {e}")
@@ -380,7 +405,7 @@ def process_single_account(browser, account, index, total):
             time.sleep(2)
 
             # 等待表单就绪或穿透 Cloudflare
-            form_ready = wait_for_login_form_or_cf(page, max_wait_sec=40)
+            form_ready = wait_for_login_form_or_cf(page, cdp_session, max_wait_sec=40)
 
             # 检查是否已直接处于登录态
             if page.locator(':text("Mes services"), :text("Tableau de bord"), a:has-text("Déconnexion")').count() > 0:
@@ -421,7 +446,7 @@ def process_single_account(browser, account, index, total):
                 submit_btn.first.click()
 
                 # 监测跳转或穿透提交后的 Cloudflare
-                if wait_for_dashboard_or_cf(page, max_wait_sec=40):
+                if wait_for_dashboard_or_cf(page, cdp_session, max_wait_sec=40):
                     logged_in = True
                     break
 
@@ -525,6 +550,10 @@ def process_single_account(browser, account, index, total):
 
     finally:
         result_info["duration"] = round(time.time() - start_time, 1)
+        try:
+            cdp_session.detach()
+        except Exception:
+            pass
         try:
             context.close()
         except Exception:
