@@ -1,11 +1,14 @@
 name: NeoHeberg Auto Reboot & Keepalive
 
 on:
-  # 定时触发：每天的 UTC 时间 03:20 执行一次 (对应北京时间 11:20)
+  # 定时触发：每天 UTC 时间 03:20 执行一次 (对应北京时间 11:20)
   schedule:
     - cron: '20 3 * * *'
   # 支持在 GitHub Actions 页面手动点击运行
   workflow_dispatch:
+  # 支持白虎面板 / Webhook 远程调用触发
+  repository_dispatch:
+    types: [tunnel_offline, neoheberg_renew]
 
 permissions:
   actions: write
@@ -17,7 +20,7 @@ jobs:
     timeout-minutes: 20
 
     steps:
-      - name: 检出公开仓库代码
+      - name: 检出当前仓库
         uses: actions/checkout@v4
 
       - name: 检出核心私有脚本仓库
@@ -40,7 +43,7 @@ jobs:
           pip install -r private-scripts/neoheberg/requirements.txt
           playwright install --with-deps chromium
 
-      - name: 执行登录与 VPS 重启保活任务
+      - name: 执行登录与 VPS 重启任务
         env:
           NEOHEBERG_ACCOUNTS: ${{ secrets.NEOHEBERG_ACCOUNTS }}
           PROXY_NODE: ${{ secrets.PROXY_NODE }}
@@ -52,7 +55,7 @@ jobs:
         run: |
           python -u private-scripts/neoheberg/neoheberg_renew.py
 
-      - name: 上传执行截图快照 (可供排查与确认)
+      - name: 上传执行截图
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -60,7 +63,7 @@ jobs:
           path: "*.png"
           retention-days: 7
 
-      - name: 自动清理历史运行记录 (仅保留最新 1 条)
+      - name: 清理历史运行记录
         if: always()
         uses: Mattraks/delete-workflow-runs@v2
         with:
