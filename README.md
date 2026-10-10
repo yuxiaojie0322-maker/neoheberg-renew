@@ -29,8 +29,8 @@
 
 | Secret 变量名 | 必填 | 示例 / 说明 |
 | :--- | :--- | :--- |
-| `NEOHEBERG_ACCOUNTS` | 选填 | 多个账号（格式为 `账号:密码,账号2:密码2`）。若未设置则默认使用内置账号 `yxj0322` |
-| `PROXY_NODE` / `NODE_LINK` | 选填 | 自定义代理节点链接（支持 `hysteria2://...`、`vmess://...`、`vless://...` 等）。内置高可用节点备选 |
+| `NEOHEBERG_ACCOUNTS` | **必填** | 账号凭据，支持 JSON 数组或 `账号:密码,账号2:密码2` 格式 |
+| `PROXY_NODE` / `NODE_LINK` | **推荐** | 代理节点链接（支持 `hysteria2://...`、`vmess://...`、`vless://...` 等），穿透 Cloudflare 盾 |
 | `TG_BOT_TOKEN` | 选填 | 你的 Telegram Bot Token（如 `123456789:ABCdefGhI...`） |
 | `TG_CHAT_ID` | 选填 | 你的 Telegram 用户 ID 或频道/群组 ID（如 `987654321`） |
 
