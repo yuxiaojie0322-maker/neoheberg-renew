@@ -743,7 +743,13 @@ def get_vps_power_status(page):
                 return 'RUNNING';
             }
             
-            // 3. 检查全局文本
+            // 3. 检查服务商母机通信状态 (Proxmox 故障)
+            const bodyText = (document.body.innerText || '');
+            if (bodyText.includes('Impossible de joindre Proxmox') || bodyText.includes('Service injoignable')) {
+                return 'PROXMOX_UNREACHABLE';
+            }
+
+            // 4. 检查全局文本
             const bodyText = (document.body.innerText || '');
             if (/\bARR[EÊ]T[EÉ]\b/i.test(bodyText)) {
                 return 'STOPPED';
@@ -1089,7 +1095,16 @@ def process_single_account(browser, account, index, total, proxy_server=None):
 
         action_performed = None
 
-        if current_status == "STOPPED":
+        if current_status == "PROXMOX_UNREACHABLE":
+            err_msg = "NeoHeberg 服务商母机通信故障（'Impossible de joindre Proxmox'），面板电源按键已被服务商禁用，无法下发开机指令，请等待服务商恢复母机通信"
+            logger.warning(f"⚠️ {err_msg}")
+            result_info["status"] = "FAIL"
+            result_info["message"] = err_msg
+            final_shot = f"error_{username}.png"
+            page.screenshot(path=final_shot, full_page=True)
+            result_info["screenshot"] = final_shot
+            return result_info
+        elif current_status == "STOPPED":
             # 明确关机状态：执行开机 (Démarrer)
             logger.info("⚠️ 【情况 1：关机状态】检测到 VPS 当前处于关机 (ARRÊTÉ)！执行开机动作：点击 'Démarrer'...")
             action_performed = "START"
