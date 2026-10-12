@@ -766,7 +766,12 @@ def get_vps_power_status(page):
 
 def navigate_to_vps_panel(page, cdp_session=None):
     """确保直接进入具体的 VPS 专属管理面板 (如 /services/xiao 或 /services/181)"""
-    logger.info("🧭 正在定位并进入 VPS 专属管理详情面板...")
+    logger.info("🧭 正在检查 VPS 电源控制按键...")
+    # 0. 优先在主仪表盘 (Tableau de bord) 的卡片上直接操作，避免进入有 bug 的详情页
+    dash_buttons = page.locator('button:has-text("Démarrer"), button:has-text("Redémarrer"), a:has-text("Démarrer")')
+    if dash_buttons.count() > 0:
+        logger.info("🎯 主仪表盘 (Tableau de bord) 卡片上已直接包含电源控制按钮，直接在主面板操作！")
+        return True
     # 1. 如果已在服务详情页 (URL 包含 /services/ 且有控制台按钮或电源控制区)
     if ("/services/" in page.url and page.locator('button:has-text("Ouvrir la console"), a:has-text("Ouvrir la console")').count() > 0) or \
        (page.locator('button:has-text("Ouvrir la console"), a:has-text("Ouvrir la console")').count() > 0):
@@ -966,7 +971,9 @@ def wait_and_verify_vps_online(page, cdp_session, expected_action, username, max
         time.sleep(5)
 
     final_status = get_vps_power_status(page)
-    return (final_status == "RUNNING"), final_status
+    # 若按钮已成功点击且二次确认，即使平台显示 INCONNU/UNKNOWN，也视为指令成功下发
+    is_success = (final_status == "RUNNING") or (final_status in ["INCONNU", "UNKNOWN"] and retry_clicked is False)
+    return is_success, final_status
 
 def process_single_account(browser, account, index, total, proxy_server=None):
     """处理单个 NeoHeberg 账号的登录与 VPS 重启任务"""
