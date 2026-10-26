@@ -830,30 +830,129 @@ def navigate_to_vps_panel(page, cdp_session=None):
 
     return False
 
-def check_and_confirm_modal(page, cdp_session=None):
-    """检测并确认二次确认弹窗 (严格限定在可见的 dialog / modal 容器内，杜绝误点页面其它按钮)"""
-    time.sleep(1.2)
-    try:
-        dialogs = page.locator('dialog:visible, [role="dialog"]:visible, [aria-modal="true"]:visible, div[class*="modal"]:visible, .swal2-container:visible')
-        if dialogs.count() > 0:
-            logger.info("⚠️ 检测到可见弹窗容器，正在检查确认按钮...")
-            confirm_btn = dialogs.first.locator('button, a, [role="button"]').filter(
-                has_text=re.compile(r'^(Confirmer|Valider|Oui|Yes|Confirm|D[eé]marrer|Red[eé]marrer|Lancer|Continuer)$', re.I)
+def check_and_confirm_modal(page, cdp_session=None, password=None, username=None, max_wait_sec=5):
+    """
+    检测并确认开机/重启的二次确认弹窗或密码输入验证：
+    - 针对 NeoHeberg 最新版开机需输入密码确认的变动，自动定位并填入账号密码
+    - 严格限定在可见的 dialog / modal / popup 容器内操作，避免误触其它页面按钮
+    - 填入密码后自动触发 input/change 事件，并点击确认提交按钮完成开机
+    """
+    start_time = time.time()
+    logger.info("🔍 正在检查是否有开机/操作二次确认弹窗 (含密码验证需求)...")
+
+    while time.time() - start_time < max_wait_sec:
+        try:
+            # 1. 查找可见的弹窗容器
+            dialogs = page.locator(
+                'dialog:visible, [role="dialog"]:visible, [aria-modal="true"]:visible, '
+                'div[class*="modal"]:visible, .modal.show:visible, .modal-dialog:visible, '
+                '.swal2-container:visible, .swal2-popup:visible'
             )
-            if confirm_btn.count() > 0 and confirm_btn.first.is_visible():
-                btn_txt = confirm_btn.first.text_content().strip()
-                logger.info(f"👉 点击弹窗确认按钮: '{btn_txt}'")
-                confirm_btn.first.click(force=True, timeout=5000)
-                time.sleep(2)
-                return True
-    except Exception as e:
-        logger.warning(f"检查弹窗提示: {e}")
+
+            modal = None
+            if dialogs.count() > 0 and dialogs.first.is_visible():
+                modal = dialogs.first
+            else:
+                # 兜底：检查是否有突然可见的密码输入框 (例如卡片内直接内联展开密码输入区域)
+                inline_pw = page.locator('input[type="password"]:visible, input[placeholder*="mot de passe" i]:visible')
+                if inline_pw.count() > 0 and inline_pw.first.is_visible():
+                    modal = page
+
+            if modal:
+                logger.info("⚠️ 检测到可见的操作确认容器或密码输入区域！")
+
+                # 截图留存弹窗现场快照
+                if username:
+                    try:
+                        page.screenshot(path=f"modal_detected_{username}.png")
+                    except Exception:
+                        pass
+
+                # 2. 检查并填写密码输入框
+                pw_selectors = [
+                    'input[type="password"]:visible',
+                    'input[name*="password" i]:visible',
+                    'input[name*="mdp" i]:visible',
+                    'input[name*="pass" i]:visible',
+                    'input[id*="password" i]:visible',
+                    'input[id*="mdp" i]:visible',
+                    'input[placeholder*="mot de passe" i]:visible',
+                    'input[placeholder*="password" i]:visible',
+                    '.swal2-input[type="password"]:visible',
+                    '.swal2-input:visible'
+                ]
+
+                pw_input = None
+                for sel in pw_selectors:
+                    inputs = modal.locator(sel)
+                    if inputs.count() > 0 and inputs.first.is_visible():
+                        pw_input = inputs.first
+                        break
+
+                if pw_input:
+                    logger.info("🔐 发现开机安全验证密码输入框，正在自动填充账号密码...")
+                    if password:
+                        try:
+                            pw_input.click()
+                            time.sleep(0.2)
+                            pw_input.fill(password)
+                            pw_input.dispatch_event("input")
+                            pw_input.dispatch_event("change")
+                            time.sleep(0.5)
+                            logger.info("✅ 账号密码填充完毕！")
+                        except Exception as e_pw:
+                            logger.warning(f"填充密码提示: {e_pw}")
+                    else:
+                        logger.warning("⚠️ 弹窗要求输入密码，但未配置当前账号的密码！")
+
+                # 3. 检查是否有需要勾选的确认复选框
+                try:
+                    cboxes = modal.locator('input[type="checkbox"]:visible')
+                    for i in range(cboxes.count()):
+                        cb = cboxes.nth(i)
+                        if not cb.is_checked():
+                            cb.check()
+                            logger.info("👉 已勾选弹窗内的确认协议复选框")
+                except Exception:
+                    pass
+
+                # 4. 寻找并点击确认提交按钮
+                # 排除取消按钮 (Annuler, Cancel, Fermer, Close)
+                confirm_btn = modal.locator('button, a, [role="button"], input[type="submit"]').filter(
+                    has_text=re.compile(r'^(Confirmer|Valider|Oui|Yes|Confirm|D[eé]marrer|Red[eé]marrer|Lancer|Continuer|OK|Envoyer|Ex[eé]cuter)$', re.I)
+                )
+                if confirm_btn.count() == 0:
+                    confirm_btn = modal.locator('button[type="submit"]:visible, button.swal2-confirm:visible, button.btn-primary:visible, button[class*="confirm"]:visible, button[class*="primary"]:visible')
+
+                if confirm_btn.count() > 0 and confirm_btn.first.is_visible():
+                    btn_txt = confirm_btn.first.text_content().strip() if confirm_btn.first.text_content() else "Submit"
+                    logger.info(f"👉 点击弹窗确认提交按钮: '{btn_txt}'")
+                    try:
+                        confirm_btn.first.click(force=True, timeout=5000)
+                    except Exception as e_click:
+                        logger.warning(f"点击确认按钮提示: {e_click}，尝试按 Enter 键触发提交...")
+                        if pw_input:
+                            pw_input.press("Enter")
+
+                    time.sleep(2)
+                    if username:
+                        try:
+                            page.screenshot(path=f"after_modal_confirm_{username}.png")
+                        except Exception:
+                            pass
+                    return True
+        except Exception as e:
+            logger.warning(f"检查弹窗逻辑提示: {e}")
+
+        time.sleep(0.8)
+
+    logger.info("ℹ️ 未检测到需要处理的确认弹窗或已无弹窗遮挡")
     return False
 
-def trigger_power_action(page, cdp_session, action_type, username):
+def trigger_power_action(page, cdp_session, action_type, username, password=None):
     """
     触发电源控制按钮 (开机 Démarrer / 重启 Redémarrer)：
-    执行单次精准触发，绝不多次连击造成请求冲突
+    执行单次精准触发，并在点击后自动检测与处理输入密码确认弹窗
     """
     btn_label = "Démarrer (开机)" if action_type == "start" else "Redémarrer (重启)"
     logger.info(f"👉 准备定位并触发 '{btn_label}' 按钮...")
@@ -921,11 +1020,11 @@ def trigger_power_action(page, cdp_session, action_type, username):
     except Exception:
         pass
 
-    # 检查并确认弹窗
-    check_and_confirm_modal(page, cdp_session)
+    # 检查并确认弹窗 (包含密码自动输入)
+    check_and_confirm_modal(page, cdp_session, password=password, username=username)
     return clicked
 
-def wait_and_verify_vps_online(page, cdp_session, expected_action, username, max_wait_sec=75):
+def wait_and_verify_vps_online(page, cdp_session, expected_action, username, max_wait_sec=75, password=None):
     """
     严格轮询监控直到确认 VPS 处于开机在线 (EN LIGNE)！
     如果等待中途发现仍为 STOPPED，会自动刷新页面同步；
@@ -965,7 +1064,7 @@ def wait_and_verify_vps_online(page, cdp_session, expected_action, username, max
             # 如果预期是开机动作且依然为 STOPPED，在 30 秒时再次尝试点击开机按钮
             if expected_action == "START" and st_reload == "STOPPED" and not retry_clicked and elapsed >= 30:
                 logger.info("⚠️ 状态仍为关机，执行补充点击 'Démarrer' 开机...")
-                trigger_power_action(page, cdp_session, 'start', username)
+                trigger_power_action(page, cdp_session, 'start', username, password=password)
                 retry_clicked = True
 
         time.sleep(5)
@@ -1115,24 +1214,24 @@ def process_single_account(browser, account, index, total, proxy_server=None):
             # 明确关机状态：执行开机 (Démarrer)
             logger.info("⚠️ 【情况 1：关机状态】检测到 VPS 当前处于关机 (ARRÊTÉ)！执行开机动作：点击 'Démarrer'...")
             action_performed = "START"
-            trigger_power_action(page, cdp_session, 'start', username)
+            trigger_power_action(page, cdp_session, 'start', username, password=password)
         elif current_status == "RUNNING":
             # 明确运行状态：执行重启保活 (Redémarrer)
             logger.info("🔄 【情况 2：开机状态】检测到 VPS 当前处于运行 (EN LIGNE)！执行保活动作：点击 'Redémarrer'...")
             action_performed = "REBOOT"
-            trigger_power_action(page, cdp_session, 'reboot', username)
+            trigger_power_action(page, cdp_session, 'reboot', username, password=password)
         else:
             logger.info("ℹ️ 【情况 3：未知状态】优先尝试点击开机 Démarrer...")
             action_performed = "START"
-            clicked = trigger_power_action(page, cdp_session, 'start', username)
+            clicked = trigger_power_action(page, cdp_session, 'start', username, password=password)
             if not clicked:
-                trigger_power_action(page, cdp_session, 'reboot', username)
+                trigger_power_action(page, cdp_session, 'reboot', username, password=password)
                 action_performed = "REBOOT"
 
         # ==================== 3. 严格监控验证开机在线后再推送 ====================
         logger.info(f"⏳ 操作指令已触发 (动作: {action_performed})，严格轮询监控直到确认开机在线 (EN LIGNE)...")
         is_online, final_status = wait_and_verify_vps_online(
-            page, cdp_session, expected_action=action_performed, username=username, max_wait_sec=75
+            page, cdp_session, expected_action=action_performed, username=username, max_wait_sec=75, password=password
         )
 
         # 最终截取状态凭证截图
