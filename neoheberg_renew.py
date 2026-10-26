@@ -750,7 +750,6 @@ def get_vps_power_status(page):
             }
 
             // 4. 检查全局文本
-            const bodyText = (document.body.innerText || '');
             if (/\bARR[EÊ]T[EÉ]\b/i.test(bodyText)) {
                 return 'STOPPED';
             }
